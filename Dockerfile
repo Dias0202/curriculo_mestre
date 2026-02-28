@@ -1,20 +1,26 @@
-# Utiliza a imagem oficial do Python otimizada e leve
-FROM python:3.11-slim
+FROM python:3.11-bullseye
 
-# Define o diretório de trabalho no container
+# Evita prompts interativos durante instalação de pacotes
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Copia os arquivos de dependência
-COPY requirements.txt .
+# Instala dependências do sistema (necessário para rede e SSL estável)
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    dnsutils \
+    && rm -rf /var/lib/apt/lists/*
 
-# Instala as dependências garantindo que o cache não ocupe espaço
+# Instala dependências Python
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia todo o código da aplicação para o container
-COPY . .
+# Copia o código
+COPY main.py .
 
-# Expõe a porta 7860 exigida pelo Hugging Face Spaces para o health check
-EXPOSE 7860
+# Porta que o Render vai expor para health check
+EXPOSE 10000
 
-# Comando de inicialização
 CMD ["python", "main.py"]
