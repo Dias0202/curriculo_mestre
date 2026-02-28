@@ -14,10 +14,16 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
+    ConversationHandler,
 )
 from telegram.request import HTTPXRequest
 from fpdf import FPDF
 from supabase import create_client, Client
+
+# =========================================================
+# ESTADOS DA CONVERSA
+# =========================================================
+ASK_EMAIL, ASK_PHONE, ASK_LINKEDIN, ASK_LANGUAGE = range(4)
 
 # =========================================================
 # LOGGING E ENV
@@ -46,8 +52,6 @@ db_client:  Client       = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =========================================================
 # SERVIDOR WEB — KEEP-ALIVE
-# O Render encerra containers que nao expõem porta HTTP.
-# Esta thread responde 200 OK para os health checks.
 # =========================================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -59,14 +63,13 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-
 def start_health_server():
     port = int(os.getenv("PORT", 10000))
     logger.info(f"[Health] Servidor iniciado na porta {port}")
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # =========================================================
-# SANITIZACAO — fpdf2 usa latin-1 internamente
+# SANITIZACAO
 # =========================================================
 _SUBS = {
     "\u2022": "-", "\u2013": "-", "\u2014": "-",
@@ -142,7 +145,6 @@ class CurriculoHarvard(FPDF):
             self.multi_cell(0, 5, sanitize(f"- {item}"))
         self.ln(3)
 
-
 def gerar_pdf(dados: dict) -> io.BytesIO:
     pdf = CurriculoHarvard()
     pdf.cabecalho_candidato(dados.get("contato", {}))
@@ -194,8 +196,23 @@ _SYSTEM = (
     "Campos sem info: string vazia ou lista vazia."
 )
 
-def gerar_curriculo_json(historico: str, vaga: str) -> dict:
-    prompt = f"HISTORICO:\n{historico}\n\nVAGA:\n{vaga}\n\nGere o JSON do curriculo."
+def gerar_curriculo_json(historico: str, vaga: str, perfil: dict) -> dict:
+    idioma = perfil.get('idioma', 'Ingles')
+    email = perfil.get('email', '')
+    telefone = perfil.get('telefone', '')
+    linkedin = perfil.get('linkedin', '')
+
+    prompt = (
+        f"HISTORICO:\n{historico}\n\n"
+        f"VAGA:\n{vaga}\n\n"
+        f"INSTRUCOES OBRIGATORIAS:\n"
+        f"1. O curriculo DEVE ser traduzido e gerado estritamente no idioma: {idioma}.\n"
+        f"2. Preencha os dados de contato EXATAMENTE com os seguintes valores:\n"
+        f"   - Email: {email}\n"
+        f"   - Telefone: {telefone}\n"
+        f"   - LinkedIn: {linkedin}\n\n"
+        f"Gere o JSON do curriculo respeitando o idioma e substituindo os placeholders."
+    )
 
     response = llm_client.models.generate_content(
         model="gemini-2.5-flash",
@@ -220,30 +237,98 @@ def salvar_historico(telegram_id: int, raw_history: str):
         on_conflict="telegram_id"
     ).execute()
 
-def buscar_historico(telegram_id: int) -> str | None:
+def salvar_perfil(telegram_id: int, dados: dict):
+    dados["telegram_id"] = str(telegram_id)
+    db_client.table("user_profiles").upsert(
+        dados,
+        on_conflict="telegram_id"
+    ).execute()
+
+def buscar_usuario(telegram_id: int) -> dict | None:
     r = (db_client.table("user_profiles")
-         .select("raw_history")
+         .select("*")
          .eq("telegram_id", str(telegram_id))
          .maybe_single()
          .execute())
-    return r.data.get("raw_history") if r.data else None
+    return r.data if r.data else None
 
 # =========================================================
-# HANDLERS
+# HANDLERS DO FLUXO DE CADASTRO
 # =========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"[Handler] /start de user_id={update.effective_user.id}")
-    await update.message.reply_text(
-        "ATS Resume Bot - Pronto.\n\n"
-        "1. Envie um arquivo .txt com seu historico profissional.\n"
-        "2. Envie a descricao da vaga como texto.\n"
-        "3. Receba seu PDF no padrao Harvard.\n\n"
-        "Seu historico fica salvo para multiplas vagas."
-    )
-
-async def handle_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc     = update.message.document
     user_id = update.effective_user.id
+    logger.info(f"[Handler] /start de user_id={user_id}")
+    
+    usuario = buscar_usuario(user_id)
+    
+    # Verifica se os dados obrigatorios ja existem
+    if usuario and usuario.get("email") and usuario.get("idioma"):
+        await update.message.reply_text(
+            "Seu perfil ja esta configurado.\n"
+            "Envie seu arquivo .txt com seu historico ou a descricao da vaga."
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Bem-vindo ao ATS Resume Bot.\n"
+        "Vamos configurar seu perfil para nao precisarmos perguntar novamente nas proximas vagas.\n\n"
+        "Qual o seu E-MAIL profissional?"
+    )
+    return ASK_EMAIL
+
+async def ask_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['email'] = update.message.text
+    await update.message.reply_text("Qual o seu numero de TELEFONE (com DDD)?")
+    return ASK_PHONE
+
+async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['telefone'] = update.message.text
+    await update.message.reply_text("Qual a URL ou o usuario do seu LINKEDIN?")
+    return ASK_LINKEDIN
+
+async def ask_linkedin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['linkedin'] = update.message.text
+    await update.message.reply_text(
+        "Em qual IDIOMA os curriculos devem ser gerados como padrao? (Ex: Ingles, Portugues, Espanhol)"
+    )
+    return ASK_LANGUAGE
+
+async def ask_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['idioma'] = update.message.text
+    user_id = update.effective_user.id
+    
+    dados = {
+        "email": context.user_data['email'],
+        "telefone": context.user_data['telefone'],
+        "linkedin": context.user_data['linkedin'],
+        "idioma": context.user_data['idioma']
+    }
+    
+    try:
+        salvar_perfil(user_id, dados)
+        await update.message.reply_text(
+            "Perfil salvo com sucesso!\n\n"
+            "Passo 1: Envie um arquivo .txt contendo o seu historico bruto.\n"
+            "Passo 2: Apos enviar o historico, envie a descricao da vaga."
+        )
+    except Exception as e:
+        logger.error(f"[Cadastro] Erro ao salvar perfil: {e}")
+        await update.message.reply_text("Erro ao processar o cadastro. Tente novamente executando /start.")
+    
+    return ConversationHandler.END
+
+# =========================================================
+# HANDLERS DE PROCESSAMENTO
+# =========================================================
+async def handle_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    usuario = buscar_usuario(user_id)
+    
+    if not usuario or not usuario.get("email"):
+        await update.message.reply_text("Conclua seu cadastro basico primeiro enviando o comando /start.")
+        return
+
+    doc = update.message.document
     logger.info(f"[Handler] Documento de user_id={user_id}: {doc.file_name}")
 
     if not doc.file_name.endswith(".txt"):
@@ -271,15 +356,21 @@ async def handle_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "Historico salvo!\nAgora envie a descricao da vaga para gerar o curriculo."
+        "Historico salvo!\nAgora envie a descricao da vaga em texto para gerar o curriculo."
     )
 
 async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id        = update.effective_user.id
+    user_id = update.effective_user.id
+    usuario = buscar_usuario(user_id)
+    
+    if not usuario or not usuario.get("email"):
+        await update.message.reply_text("Conclua seu cadastro basico primeiro enviando o comando /start.")
+        return
+
     descricao_vaga = update.message.text
     logger.info(f"[Handler] Texto de user_id={user_id}: {descricao_vaga[:60]}")
 
-    historico = buscar_historico(user_id)
+    historico = usuario.get("raw_history")
     if not historico:
         await update.message.reply_text(
             "Nenhum historico encontrado.\n"
@@ -290,7 +381,7 @@ async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("Analisando perfil... Aguarde.")
 
     try:
-        dados = gerar_curriculo_json(historico, descricao_vaga)
+        dados = gerar_curriculo_json(historico, descricao_vaga, usuario)
     except json.JSONDecodeError as e:
         logger.error(f"[Gemini] JSON invalido: {e}")
         await msg.edit_text("Modelo retornou resposta invalida. Tente novamente.")
@@ -314,7 +405,7 @@ async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(
         document=pdf_buf,
         filename=nome_arquivo,
-        caption=f"Curriculo ATS gerado: {nome}\nEnvie outra vaga para gerar novamente.",
+        caption=f"Curriculo ATS gerado: {nome}\nIdioma Base: {usuario.get('idioma')}\nEnvie outra vaga para gerar novamente.",
     )
     await msg.delete()
 
@@ -322,18 +413,15 @@ async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"[Erro] {context.error}", exc_info=context.error)
 
 # =========================================================
-# MAIN — POLLING (funciona no Render.com)
+# MAIN — POLLING
 # =========================================================
 def main():
     logger.info("=" * 60)
     logger.info("Iniciando ATS Resume Bot")
     logger.info("=" * 60)
 
-    # Thread keep-alive para health check do Render
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    # Motor HTTP com timeouts altos e HTTP/1.1 forçado
-    # para estabilizar TLS em nós de nuvem
     custom_request = HTTPXRequest(
         connect_timeout=60.0,
         read_timeout=60.0,
@@ -347,7 +435,19 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
+    # Inicializacao da maquina de estados para onboarding
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
+        states={
+            ASK_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_email)],
+            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
+            ASK_LINKEDIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_linkedin)],
+            ASK_LANGUAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_language)],
+        },
+        fallbacks=[CommandHandler("start", cmd_start)],
+    )
+
+    app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_documento))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_texto))
     app.add_error_handler(handle_erro)
@@ -357,7 +457,6 @@ def main():
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
-
 
 if __name__ == "__main__":
     main()
