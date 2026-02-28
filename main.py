@@ -69,7 +69,7 @@ def start_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # =========================================================
-# SANITIZACAO
+# SANITIZACAO E PARSER DE ARQUIVOS
 # =========================================================
 _SUBS = {
     "\u2022": "-", "\u2013": "-", "\u2014": "-",
@@ -84,6 +84,26 @@ def sanitize(text: str) -> str:
     for char, rep in _SUBS.items():
         text = text.replace(char, rep)
     return text.encode("latin-1", "ignore").decode("latin-1")
+
+def extrair_texto_de_arquivo(file_bytes: bytearray, filename: str) -> str:
+    if filename.lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(file_bytes))
+            text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
+            return text
+        except Exception as e:
+            logger.error(f"Erro ao extrair PDF: {e}")
+            raise Exception("Falha na extração do PDF.")
+    else:
+        # Tenta múltiplas codificações para suportar arquivos do Windows
+        encodings = ["utf-8", "utf-16", "latin-1", "cp1252"]
+        for enc in encodings:
+            try:
+                return file_bytes.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return file_bytes.decode("utf-8", errors="ignore")
 
 # =========================================================
 # GERADOR DE PDF — PADRAO HARVARD
@@ -176,8 +196,42 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
     return buf
 
 # =========================================================
-# GEMINI — JSON ESTRUTURADO
+# MOTORES LLM (ROTEADOR, CONSOLIDADOR E GERADOR)
 # =========================================================
+def classificar_intencao_llm(texto: str) -> str:
+    prompt = (
+        "Analise o texto fornecido e determine a intencao do usuario. "
+        "Se o texto contiver um curriculo, historico profissional, instrucoes para adicionar/remover competencias, "
+        "ou atualizacoes de carreira, responda estritamente com a palavra 'HISTORICO'. "
+        "Se o texto for a descricao de uma vaga de emprego, listando requisitos de contratacao, "
+        "responda estritamente com a palavra 'VAGA'.\n\n"
+        f"TEXTO:\n{texto[:1500]}"
+    )
+    response = llm_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=genai.types.GenerateContentConfig(temperature=0.0)
+    )
+    return "VAGA" if "VAGA" in response.text.upper() else "HISTORICO"
+
+def consolidar_historico_llm(historico_atual: str, nova_interacao: str) -> str:
+    prompt = (
+        "Voce atua como um sistema de banco de dados de curriculos. O usuario enviou uma nova informacao ou instrucao.\n\n"
+        f"HISTORICO ATUAL SALVO:\n{historico_atual}\n\n"
+        f"NOVA INTERACAO DO USUARIO:\n{nova_interacao}\n\n"
+        "Sua tarefa: Reescreva o historico atual incorporando a nova interacao. "
+        "Se a nova interacao for um curriculo novo, substitua e complemente. "
+        "Se for uma instrucao (ex: 'adicione que falo ingles'), aplique a mudanca. "
+        "Se for uma instrucao de exclusao, remova os dados. "
+        "Nao invente dados. Retorne APENAS o texto do historico consolidado, sem introducoes ou comentarios adicionais."
+    )
+    response = llm_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=genai.types.GenerateContentConfig(temperature=0.2)
+    )
+    return response.text.strip()
+
 _SCHEMA = """{
   "contato": {"nome":"","email":"","telefone":"","linkedin":"","cidade":""},
   "resumo": "2-4 frases de impacto alinhadas a vaga",
@@ -261,11 +315,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     usuario = buscar_usuario(user_id)
     
-    # Verifica se os dados obrigatorios ja existem
     if usuario and usuario.get("email") and usuario.get("idioma"):
         await update.message.reply_text(
             "Seu perfil ja esta configurado.\n"
-            "Envie seu arquivo .txt com seu historico ou a descricao da vaga."
+            "Voce pode colar textos no chat ou enviar arquivos (.txt, .pdf).\n"
+            "O sistema determinara automaticamente se voce esta atualizando o seu perfil ou solicitando uma vaga."
         )
         return ConversationHandler.END
 
@@ -308,116 +362,101 @@ async def ask_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
         salvar_perfil(user_id, dados)
         await update.message.reply_text(
             "Perfil salvo com sucesso!\n\n"
-            "Passo 1: Envie um arquivo .txt contendo o seu historico bruto.\n"
-            "Passo 2: Apos enviar o historico, envie a descricao da vaga."
+            "O bot trabalha de forma automatica e contextual. Voce pode colar seu historico profissional "
+            "ou a descricao de uma vaga de emprego a qualquer momento. O sistema sabera o que fazer."
         )
     except Exception as e:
         logger.error(f"[Cadastro] Erro ao salvar perfil: {e}")
-        await update.message.reply_text("Erro ao processar o cadastro. Tente novamente executando /start.")
+        await update.message.reply_text("Erro interno. Tente novamente com /start.")
     
     return ConversationHandler.END
 
 # =========================================================
-# HANDLERS DE PROCESSAMENTO
+# HANDLER UNIFICADO DE PROCESSAMENTO DE CONTEXTO
 # =========================================================
-async def handle_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_input_inteligente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     usuario = buscar_usuario(user_id)
     
     if not usuario or not usuario.get("email"):
-        await update.message.reply_text("Conclua seu cadastro basico primeiro enviando o comando /start.")
+        await update.message.reply_text("Processo recusado. Conclua seu cadastro basico enviando o comando /start.")
         return
 
-    doc = update.message.document
-    logger.info(f"[Handler] Documento de user_id={user_id}: {doc.file_name}")
+    texto_extraido = ""
+    msg_status = await update.message.reply_text("Recebendo dados...")
 
-    if not doc.file_name.endswith(".txt"):
-        await update.message.reply_text("Envie um arquivo .txt com seu historico.")
-        return
-
-    await update.message.reply_text("Recebendo historico...")
-
-    try:
-        file = await context.bot.get_file(doc.file_id)
-        buf  = bytearray()
-        await file.download_as_bytearray(out=buf)
-        
-        # Tenta decodificar nativamente em UTF-8
+    # Extração de dados (Suporta Arquivos TXT, PDF ou Texto Direto)
+    if update.message.document:
+        doc = update.message.document
+        if not doc.file_name.lower().endswith(('.txt', '.pdf')):
+            await msg_status.edit_text("Formato invalido. Envie apenas .txt ou .pdf.")
+            return
         try:
-            historico = buf.decode("utf-8")
-        except UnicodeDecodeError:
-            # Fallback para arquivos criados no Bloco de Notas do Windows (ANSI/cp1252/latin-1)
-            historico = buf.decode("latin-1")
-            
-    except Exception as e:
-        logger.error(f"[Documento] Erro: {e}")
-        await update.message.reply_text("Falha ao ler arquivo. Verifique se e um arquivo de texto valido.")
+            file = await context.bot.get_file(doc.file_id)
+            buf = bytearray()
+            await file.download_as_bytearray(out=buf)
+            texto_extraido = extrair_texto_de_arquivo(buf, doc.file_name)
+        except Exception as e:
+            logger.error(f"[Documento] Erro extração: {e}")
+            await msg_status.edit_text("Falha ao extrair texto do arquivo submetido.")
+            return
+    elif update.message.text:
+        texto_extraido = update.message.text
+
+    if not texto_extraido.strip():
+        await msg_status.edit_text("Nenhum texto detectado para processamento.")
         return
 
-    try:
-        salvar_historico(user_id, historico)
-        logger.info(f"[Supabase] Historico salvo para {user_id}")
-    except Exception as e:
-        logger.error(f"[Supabase] Erro: {e}")
-        await update.message.reply_text("Falha ao salvar no banco. Tente novamente.")
-        return
+    await msg_status.edit_text("Classificando contexto da requisicao...")
+    intencao = classificar_intencao_llm(texto_extraido)
 
-    await update.message.reply_text(
-        "Historico salvo!\nAgora envie a descricao da vaga em texto para gerar o curriculo."
-    )
+    # Fluxo 1: Atualização de Histórico
+    if intencao == "HISTORICO":
+        await msg_status.edit_text("Atualizando a sua base de dados profissional...")
+        historico_atual = usuario.get("raw_history", "")
+        
+        if historico_atual:
+            historico_atualizado = consolidar_historico_llm(historico_atual, texto_extraido)
+        else:
+            historico_atualizado = texto_extraido
 
-async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    usuario = buscar_usuario(user_id)
-    
-    if not usuario or not usuario.get("email"):
-        await update.message.reply_text("Conclua seu cadastro basico primeiro enviando o comando /start.")
-        return
+        try:
+            salvar_historico(user_id, historico_atualizado)
+            await msg_status.edit_text("Contexto profissional processado e salvo. O bot esta pronto para receber a vaga de emprego.")
+        except Exception as e:
+            logger.error(f"[Supabase] Erro ao salvar historico: {e}")
+            await msg_status.edit_text("Falha na persistencia dos dados.")
 
-    descricao_vaga = update.message.text
-    logger.info(f"[Handler] Texto de user_id={user_id}: {descricao_vaga[:60]}")
+    # Fluxo 2: Geração de Currículo para Vaga
+    elif intencao == "VAGA":
+        historico_atual = usuario.get("raw_history")
+        if not historico_atual:
+            await msg_status.edit_text("Nenhum historico de carreira encontrado no sistema. Envie os seus dados primeiro.")
+            return
 
-    historico = usuario.get("raw_history")
-    if not historico:
-        await update.message.reply_text(
-            "Nenhum historico encontrado.\n"
-            "Envie primeiro um arquivo .txt com seu historico."
+        await msg_status.edit_text("Contexto de vaga identificado. Estruturando documento otimizado...")
+        try:
+            dados = gerar_curriculo_json(historico_atual, texto_extraido, usuario)
+            pdf_buf = gerar_pdf(dados)
+        except json.JSONDecodeError:
+            await msg_status.edit_text("Falha na geracao da estrutura ATS. Requisite novamente.")
+            return
+        except Exception as e:
+            logger.error(f"[Geracao] Erro: {e}")
+            await msg_status.edit_text("Erro critico de geracao.")
+            return
+
+        nome_arquivo = f"CV_{dados.get('contato', {}).get('nome', 'Candidato').replace(' ', '_')}_ATS.pdf"
+        await msg_status.edit_text("Concluido. Enviando PDF...")
+        await update.message.reply_document(
+            document=pdf_buf,
+            filename=nome_arquivo,
+            caption=f"Processo finalizado. Idioma aplicado: {usuario.get('idioma')}."
         )
-        return
-
-    msg = await update.message.reply_text("Analisando perfil... Aguarde.")
-
-    try:
-        dados = gerar_curriculo_json(historico, descricao_vaga, usuario)
-    except json.JSONDecodeError as e:
-        logger.error(f"[Gemini] JSON invalido: {e}")
-        await msg.edit_text("Modelo retornou resposta invalida. Tente novamente.")
-        return
-    except Exception as e:
-        logger.error(f"[Gemini] Erro: {e}")
-        await msg.edit_text("Falha no modelo de IA. Tente novamente.")
-        return
-
-    try:
-        pdf_buf = gerar_pdf(dados)
-    except Exception as e:
-        logger.error(f"[PDF] Erro: {e}")
-        await msg.edit_text("Falha ao gerar PDF.")
-        return
-
-    nome         = dados.get("contato", {}).get("nome", "Candidato")
-    nome_arquivo = f"CV_{nome.replace(' ', '_')}_ATS.pdf"
-
-    await msg.edit_text("Compilando PDF...")
-    await update.message.reply_document(
-        document=pdf_buf,
-        filename=nome_arquivo,
-        caption=f"Curriculo ATS gerado: {nome}\nIdioma Base: {usuario.get('idioma')}\nEnvie outra vaga para gerar novamente.",
-    )
-    await msg.delete()
+        await msg_status.delete()
 
 async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"[Erro] {context.error}", exc_info=context.error)
+    logger.error(f"[Erro Global] {context.error}", exc_info=context.error)
 
 # =========================================================
 # MAIN — POLLING
@@ -442,7 +481,6 @@ def main():
         .build()
     )
 
-    # Inicializacao da maquina de estados para onboarding
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -455,11 +493,12 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_documento))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_texto))
+    # Direciona documentos (TXT, PDF) e mensagens de texto puro para o analisador inteligente
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_input_inteligente))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_inteligente))
     app.add_error_handler(handle_erro)
 
-    logger.info("Bot em modo de escuta (polling)...")
+    logger.info("Sistema ativo aguardando requisicoes.")
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
