@@ -341,10 +341,17 @@ async def handle_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(doc.file_id)
         buf  = bytearray()
         await file.download_as_bytearray(out=buf)
-        historico = buf.decode("utf-8")
+        
+        # Tenta decodificar nativamente em UTF-8
+        try:
+            historico = buf.decode("utf-8")
+        except UnicodeDecodeError:
+            # Fallback para arquivos criados no Bloco de Notas do Windows (ANSI/cp1252/latin-1)
+            historico = buf.decode("latin-1")
+            
     except Exception as e:
         logger.error(f"[Documento] Erro: {e}")
-        await update.message.reply_text("Falha ao ler arquivo. Use encoding UTF-8.")
+        await update.message.reply_text("Falha ao ler arquivo. Verifique se e um arquivo de texto valido.")
         return
 
     try:
@@ -358,59 +365,6 @@ async def handle_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Historico salvo!\nAgora envie a descricao da vaga em texto para gerar o curriculo."
     )
-
-async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    usuario = buscar_usuario(user_id)
-    
-    if not usuario or not usuario.get("email"):
-        await update.message.reply_text("Conclua seu cadastro basico primeiro enviando o comando /start.")
-        return
-
-    descricao_vaga = update.message.text
-    logger.info(f"[Handler] Texto de user_id={user_id}: {descricao_vaga[:60]}")
-
-    historico = usuario.get("raw_history")
-    if not historico:
-        await update.message.reply_text(
-            "Nenhum historico encontrado.\n"
-            "Envie primeiro um arquivo .txt com seu historico."
-        )
-        return
-
-    msg = await update.message.reply_text("Analisando perfil... Aguarde.")
-
-    try:
-        dados = gerar_curriculo_json(historico, descricao_vaga, usuario)
-    except json.JSONDecodeError as e:
-        logger.error(f"[Gemini] JSON invalido: {e}")
-        await msg.edit_text("Modelo retornou resposta invalida. Tente novamente.")
-        return
-    except Exception as e:
-        logger.error(f"[Gemini] Erro: {e}")
-        await msg.edit_text("Falha no modelo de IA. Tente novamente.")
-        return
-
-    try:
-        pdf_buf = gerar_pdf(dados)
-    except Exception as e:
-        logger.error(f"[PDF] Erro: {e}")
-        await msg.edit_text("Falha ao gerar PDF.")
-        return
-
-    nome         = dados.get("contato", {}).get("nome", "Candidato")
-    nome_arquivo = f"CV_{nome.replace(' ', '_')}_ATS.pdf"
-
-    await msg.edit_text("Compilando PDF...")
-    await update.message.reply_document(
-        document=pdf_buf,
-        filename=nome_arquivo,
-        caption=f"Curriculo ATS gerado: {nome}\nIdioma Base: {usuario.get('idioma')}\nEnvie outra vaga para gerar novamente.",
-    )
-    await msg.delete()
-
-async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"[Erro] {context.error}", exc_info=context.error)
 
 # =========================================================
 # MAIN — POLLING
