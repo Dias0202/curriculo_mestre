@@ -299,13 +299,20 @@ def salvar_perfil(telegram_id: int, dados: dict):
     ).execute()
 
 def buscar_usuario(telegram_id: int) -> dict | None:
-    r = (db_client.table("user_profiles")
-         .select("*")
-         .eq("telegram_id", str(telegram_id))
-         .maybe_single()
-         .execute())
-    return r.data if r.data else None
-
+    try:
+        r = (db_client.table("user_profiles")
+             .select("*")
+             .eq("telegram_id", str(telegram_id))
+             .execute())
+        
+        # Verifica com segurança se a propriedade data existe e não está vazia
+        if hasattr(r, 'data') and isinstance(r.data, list) and len(r.data) > 0:
+            return r.data[0]
+            
+    except Exception as e:
+        logger.error(f"[Supabase] Falha ao buscar usuario {telegram_id}: {e}")
+        
+    return None
 # =========================================================
 # HANDLERS DO FLUXO DE CADASTRO
 # =========================================================
