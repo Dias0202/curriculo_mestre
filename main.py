@@ -2,11 +2,22 @@ import os
 import io
 import json
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from dotenv import dotenv_values
 from google import genai
 from google.genai import types
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
+)
+
 from fpdf import FPDF
 from supabase import create_client, Client
 
@@ -20,12 +31,35 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 env = dotenv_values(ENV_PATH)
 
-TELEGRAM_TOKEN = env.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = env.get("GEMINI_API_KEY")
-SUPABASE_URL = env.get("SUPABASE_URL")
-SUPABASE_KEY = env.get("SUPABASE_KEY")
+# Prioriza variáveis de ambiente nativas (nuvem) e usa o .env como fallback (local)
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") or env.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or env.get("GEMINI_API_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL") or env.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or env.get("SUPABASE_KEY")
 
 MODEL_NAME = "gemini-2.5-flash"
+
+if not all([TELEGRAM_TOKEN, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
+    logger.warning("Aviso: Variaveis de ambiente ausentes. O deploy pode falhar se os Secrets nao estiverem configurados na nuvem.")
+
+# =========================================================
+# SERVIDOR WEB FANTASMA (HEALTH CHECK PARA NUVEM)
+# =========================================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot ATS ativo e operando.")
+
+    def log_message(self, format, *args):
+        # Suprime logs de acesso HTTP no console
+        pass
+
+def iniciar_servidor_web():
+    porta = int(os.environ.get("PORT", 7860))
+    servidor = HTTPServer(("0.0.0.0", porta), HealthCheckHandler)
+    servidor.serve_forever()
 
 # =========================================================
 # INICIALIZAÇÃO DE CLIENTES
@@ -33,9 +67,8 @@ MODEL_NAME = "gemini-2.5-flash"
 llm_client = genai.Client(api_key=GEMINI_API_KEY)
 db_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
 # =========================================================
-# CLASSE PDF HARVARD (MANTIDA)
+# CLASSE PDF HARVARD
 # =========================================================
 class CurriculoHarvard(FPDF):
     def __init__(self):
@@ -86,7 +119,6 @@ class CurriculoHarvard(FPDF):
         self.multi_cell(0, 5, detalhes)
         self.ln(1)
 
-
 # =========================================================
 # SANITIZAÇÃO E BANCO DE DADOS
 # =========================================================
@@ -95,7 +127,6 @@ def sanitizar_texto(texto: str) -> str:
     substituicoes = {"–": "-", "—": "-", "‘": "'", "’": "'", "“": '"', "”": '"', "•": "-", "\u200b": ""}
     for busca, troca in substituicoes.items(): texto = texto.replace(busca, troca)
     return texto.encode('latin-1', 'ignore').decode('latin-1')
-
 
 def sanitizar_dados(dados):
     if isinstance(dados, dict):
@@ -106,16 +137,12 @@ def sanitizar_dados(dados):
         return sanitizar_texto(dados)
     return dados
 
-
 def salvar_historico_supabase(telegram_id: int, conteudo_raw: str):
-    # Opcional: Aqui poderíamos usar o LLM para já gerar o JSON estruturado na ingestão.
-    # Por eficiência, salvaremos o raw text e estruturamos na geração.
     data = {
         "telegram_id": telegram_id,
         "raw_history": conteudo_raw
     }
     db_client.table("user_profiles").upsert(data).execute()
-
 
 def recuperar_historico_supabase(telegram_id: int) -> str:
     response = db_client.table("user_profiles").select("raw_history").eq("telegram_id", telegram_id).execute()
@@ -123,11 +150,8 @@ def recuperar_historico_supabase(telegram_id: int) -> str:
         return response.data[0]["raw_history"]
     return None
 
-
 def detectar_idioma(descricao: str) -> str:
-    return "English" if any(
-        termo in descricao.lower() for termo in ["requirements", "experience", "responsibilities"]) else "Portuguese"
-
+    return "English" if any(termo in descricao.lower() for termo in ["requirements", "experience", "responsibilities"]) else "Portuguese"
 
 # =========================================================
 # LÓGICA DE GERAÇÃO COM ANCORAGEM (TAILORING)
@@ -180,11 +204,10 @@ def gerar_dados_cv_json(descricao_vaga: str, curriculo_base: str, idioma: str) -
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            temperature=0.3  # Levemente maior para permitir flexibilidade na reescrita
+            temperature=0.3 
         )
     )
     return json.loads(response.text)
-
 
 def compilar_pdf_harvard(dados_cv: dict, idioma: str) -> io.BytesIO:
     pdf = CurriculoHarvard()
@@ -216,14 +239,12 @@ def compilar_pdf_harvard(dados_cv: dict, idioma: str) -> io.BytesIO:
     buffer.seek(0)
     return buffer
 
-
 # =========================================================
 # TELEGRAM HANDLERS
 # =========================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "Sistema ATS conectado ao banco de dados.\n1. Envie seu .txt com histórico.\n2. Envie a descrição da vaga."
+    msg = "Sistema ATS conectado ao banco de dados e nuvem.\n1. Envie seu .txt com histórico.\n2. Envie a descrição da vaga."
     await update.message.reply_text(msg)
-
 
 async def receber_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
     documento = update.message.document
@@ -239,7 +260,6 @@ async def receber_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
     salvar_historico_supabase(telegram_id, conteudo_str)
 
     await update.message.reply_text("Perfil salvo estruturalmente no banco de dados.")
-
 
 async def processar_vaga(update: Update, context: ContextTypes.DEFAULT_TYPE):
     descricao = update.message.text
@@ -268,15 +288,29 @@ async def processar_vaga(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Falha na pipeline.")
         await update.message.reply_text(f"Erro no processamento: {str(e)}")
 
-
+# =========================================================
+# MAIN
+# =========================================================
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    logger.info("Iniciando thread do servidor HTTP fantasma na porta 7860...")
+    threading.Thread(target=iniciar_servidor_web, daemon=True).start()
+
+    logger.info("Inicializando os serviços do bot do Telegram...")
+    # Timouts aumentados para lidar com instabilidades de rede e ambientes conteinerizados
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .build()
+    )
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, receber_documento))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, processar_vaga))
-    logger.info("Serviço em execução.")
-    app.run_polling()
-
+    
+    logger.info("Serviço do bot em execução.")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
