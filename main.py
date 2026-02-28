@@ -5,312 +5,359 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from dotenv import dotenv_values
+from dotenv import load_dotenv
 from google import genai
-from google.genai import types
-
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     filters,
-    ContextTypes
+    ContextTypes,
 )
-
+from telegram.request import HTTPXRequest
 from fpdf import FPDF
 from supabase import create_client, Client
 
 # =========================================================
-# CONFIGURAÇÃO DE LOGGING E ENV
+# LOGGING E ENV
 # =========================================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
+load_dotenv()
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_PATH = os.path.join(BASE_DIR, ".env")
-env = dotenv_values(ENV_PATH)
-
-# Prioriza variáveis de ambiente nativas (nuvem) e usa o .env como fallback (local)
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") or env.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or env.get("GEMINI_API_KEY")
-SUPABASE_URL = os.environ.get("SUPABASE_URL") or env.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or env.get("SUPABASE_KEY")
-
-MODEL_NAME = "gemini-2.5-flash"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY",  "").strip()
+SUPABASE_URL    = os.getenv("SUPABASE_URL",    "").strip()
+SUPABASE_KEY    = os.getenv("SUPABASE_KEY",    "").strip()
 
 if not all([TELEGRAM_TOKEN, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
-    logger.warning("Aviso: Variaveis de ambiente ausentes. O deploy pode falhar se os Secrets nao estiverem configurados na nuvem.")
+    logger.error("ERRO CRITICO: Variaveis de ambiente ausentes.")
+    raise SystemExit(1)
 
 # =========================================================
-# SERVIDOR WEB FANTASMA (HEALTH CHECK PARA NUVEM)
+# CLIENTES EXTERNOS
 # =========================================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
+llm_client: genai.Client = genai.Client(api_key=GEMINI_API_KEY)
+db_client:  Client       = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# =========================================================
+# SERVIDOR WEB — KEEP-ALIVE
+# O Render encerra containers que nao expõem porta HTTP.
+# Esta thread responde 200 OK para os health checks.
+# =========================================================
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
+        self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot ATS ativo e operando.")
+        self.wfile.write(b"ATS Bot Operacional")
 
     def log_message(self, format, *args):
-        # Suprime logs de acesso HTTP no console
         pass
 
-def iniciar_servidor_web():
-    porta = int(os.environ.get("PORT", 7860))
-    servidor = HTTPServer(("0.0.0.0", porta), HealthCheckHandler)
-    servidor.serve_forever()
+
+def start_health_server():
+    port = int(os.getenv("PORT", 10000))
+    logger.info(f"[Health] Servidor iniciado na porta {port}")
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # =========================================================
-# INICIALIZAÇÃO DE CLIENTES
+# SANITIZACAO — fpdf2 usa latin-1 internamente
 # =========================================================
-llm_client = genai.Client(api_key=GEMINI_API_KEY)
-db_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+_SUBS = {
+    "\u2022": "-", "\u2013": "-", "\u2014": "-",
+    "\u2018": "'", "\u2019": "'",
+    "\u201c": '"', "\u201d": '"',
+    "\u00b7": "-", "\u2026": "...",
+}
+
+def sanitize(text: str) -> str:
+    if not text:
+        return ""
+    for char, rep in _SUBS.items():
+        text = text.replace(char, rep)
+    return text.encode("latin-1", "ignore").decode("latin-1")
 
 # =========================================================
-# CLASSE PDF HARVARD
+# GERADOR DE PDF — PADRAO HARVARD
 # =========================================================
 class CurriculoHarvard(FPDF):
     def __init__(self):
-        super().__init__(format='A4')
-        self.set_margins(15, 15, 15)
+        super().__init__()
+        self.set_margins(left=20, top=20, right=20)
         self.add_page()
         self.set_auto_page_break(auto=True, margin=15)
 
-    def cabecalho_candidato(self, nome, contatos):
-        self.set_font("Times", 'B', 16)
-        self.cell(0, 8, nome.upper(), align='C', new_x="LMARGIN", new_y="NEXT")
-        self.set_font("Times", '', 10)
-        linha_contato = " | ".join(contatos)
-        self.cell(0, 5, linha_contato, align='C', new_x="LMARGIN", new_y="NEXT")
-        self.ln(5)
-
-    def titulo_secao(self, titulo):
-        self.set_font("Times", 'B', 11)
-        self.cell(0, 6, titulo.upper(), new_x="LMARGIN", new_y="NEXT")
-        self.line(self.get_x(), self.get_y(), 210 - self.r_margin, self.get_y())
-        self.ln(2)
-
-    def paragrafo_resumo(self, texto):
-        self.set_font("Times", '', 10)
-        self.multi_cell(0, 5, texto)
+    def cabecalho_candidato(self, dados: dict):
+        self.set_font("Arial", "B", 16)
+        self.cell(0, 10, sanitize(dados.get("nome", "")),
+                  new_x="LMARGIN", new_y="NEXT", align="C")
+        partes = [v for k, v in dados.items() if k != "nome" and v]
+        if partes:
+            self.set_font("Arial", "", 10)
+            self.cell(0, 6, sanitize(" | ".join(partes)),
+                      new_x="LMARGIN", new_y="NEXT", align="C")
         self.ln(4)
 
-    def item_experiencia(self, titulo, empresa, local, data, atividades):
-        self.set_font("Times", 'B', 10)
-        self.cell(100, 5, titulo)
-        self.set_font("Times", '', 10)
-        self.cell(0, 5, data, align='R', new_x="LMARGIN", new_y="NEXT")
-        self.set_font("Times", 'I', 10)
-        self.cell(100, 5, empresa)
-        self.set_font("Times", '', 10)
-        self.cell(0, 5, local, align='R', new_x="LMARGIN", new_y="NEXT")
-        self.set_font("Times", '', 10)
-        if isinstance(atividades, list):
-            for bullet in atividades:
-                self.set_x(20)
-                self.multi_cell(0, 5, f"- {bullet}")
+    def secao(self, titulo: str):
+        self.set_font("Arial", "B", 12)
+        self.cell(0, 8, sanitize(titulo.upper()), new_x="LMARGIN", new_y="NEXT")
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+        self.ln(2)
+
+    def item_experiencia(self, exp: dict):
+        self.set_font("Arial", "B", 11)
+        self.cell(0, 6,
+                  sanitize(f"{exp.get('cargo','')} -- {exp.get('empresa','')}"),
+                  new_x="LMARGIN", new_y="NEXT")
+        self.set_font("Arial", "I", 10)
+        self.cell(0, 5, sanitize(exp.get("periodo", "")), new_x="LMARGIN", new_y="NEXT")
+        self.ln(1)
+        self.set_font("Arial", "", 10)
+        for b in exp.get("conquistas", []):
+            self.multi_cell(0, 5, sanitize(f"- {b}"))
         self.ln(3)
 
-    def item_simples(self, titulo, detalhes):
-        self.set_font("Times", 'B', 10)
-        self.write(5, f"{titulo}: ")
-        self.set_font("Times", '', 10)
-        self.multi_cell(0, 5, detalhes)
-        self.ln(1)
+    def item_educacao(self, edu: dict):
+        self.set_font("Arial", "B", 11)
+        self.cell(0, 6, sanitize(edu.get("curso", "")), new_x="LMARGIN", new_y="NEXT")
+        self.set_font("Arial", "", 10)
+        self.cell(0, 5,
+                  sanitize(f"{edu.get('instituicao','')} | {edu.get('periodo','')}"),
+                  new_x="LMARGIN", new_y="NEXT")
+        self.ln(3)
+
+    def bloco_texto(self, texto: str):
+        self.set_font("Arial", "", 10)
+        self.multi_cell(0, 5, sanitize(texto))
+        self.ln(3)
+
+    def lista_simples(self, itens: list):
+        self.set_font("Arial", "", 10)
+        for item in itens:
+            self.multi_cell(0, 5, sanitize(f"- {item}"))
+        self.ln(3)
+
+
+def gerar_pdf(dados: dict) -> io.BytesIO:
+    pdf = CurriculoHarvard()
+    pdf.cabecalho_candidato(dados.get("contato", {}))
+
+    if dados.get("resumo"):
+        pdf.secao("Resumo Profissional")
+        pdf.bloco_texto(dados["resumo"])
+    if dados.get("experiencias"):
+        pdf.secao("Experiencia Profissional")
+        for exp in dados["experiencias"]:
+            pdf.item_experiencia(exp)
+    if dados.get("educacao"):
+        pdf.secao("Formacao Academica")
+        for edu in dados["educacao"]:
+            pdf.item_educacao(edu)
+    if dados.get("competencias"):
+        pdf.secao("Competencias Tecnicas")
+        pdf.lista_simples(dados["competencias"])
+    if dados.get("certificacoes"):
+        pdf.secao("Certificacoes")
+        pdf.lista_simples(dados["certificacoes"])
+    if dados.get("idiomas"):
+        pdf.secao("Idiomas")
+        pdf.lista_simples(dados["idiomas"])
+
+    buf = io.BytesIO()
+    pdf.output(buf)
+    buf.seek(0)
+    return buf
 
 # =========================================================
-# SANITIZAÇÃO E BANCO DE DADOS
+# GEMINI — JSON ESTRUTURADO
 # =========================================================
-def sanitizar_texto(texto: str) -> str:
-    if not isinstance(texto, str): return texto
-    substituicoes = {"–": "-", "—": "-", "‘": "'", "’": "'", "“": '"', "”": '"', "•": "-", "\u200b": ""}
-    for busca, troca in substituicoes.items(): texto = texto.replace(busca, troca)
-    return texto.encode('latin-1', 'ignore').decode('latin-1')
+_SCHEMA = """{
+  "contato": {"nome":"","email":"","telefone":"","linkedin":"","cidade":""},
+  "resumo": "2-4 frases de impacto alinhadas a vaga",
+  "experiencias": [{"cargo":"","empresa":"","periodo":"","conquistas":["verbo + metrica"]}],
+  "educacao": [{"curso":"","instituicao":"","periodo":""}],
+  "competencias": [""],
+  "certificacoes": [""],
+  "idiomas": ["Idioma - Nivel"]
+}"""
 
-def sanitizar_dados(dados):
-    if isinstance(dados, dict):
-        return {k: sanitizar_dados(v) for k, v in dados.items()}
-    elif isinstance(dados, list):
-        return [sanitizar_dados(v) for v in dados]
-    elif isinstance(dados, str):
-        return sanitizar_texto(dados)
-    return dados
+_SYSTEM = (
+    "Voce e um recrutador tecnico senior especialista em curriculos ATS no padrao Harvard.\n"
+    "REGRAS: Retorne SOMENTE JSON valido sem markdown. "
+    f"Schema: {_SCHEMA}. "
+    "Nunca invente dados. Use apenas ASCII (sem acentos). "
+    "Campos sem info: string vazia ou lista vazia."
+)
 
-def salvar_historico_supabase(telegram_id: int, conteudo_raw: str):
-    data = {
-        "telegram_id": telegram_id,
-        "raw_history": conteudo_raw
-    }
-    db_client.table("user_profiles").upsert(data).execute()
-
-def recuperar_historico_supabase(telegram_id: int) -> str:
-    response = db_client.table("user_profiles").select("raw_history").eq("telegram_id", telegram_id).execute()
-    if response.data and len(response.data) > 0:
-        return response.data[0]["raw_history"]
-    return None
-
-def detectar_idioma(descricao: str) -> str:
-    return "English" if any(termo in descricao.lower() for termo in ["requirements", "experience", "responsibilities"]) else "Portuguese"
-
-# =========================================================
-# LÓGICA DE GERAÇÃO COM ANCORAGEM (TAILORING)
-# =========================================================
-def gerar_dados_cv_json(descricao_vaga: str, curriculo_base: str, idioma: str) -> dict:
-    prompt = f"""
-    You are an expert technical recruiter and ATS optimization specialist.
-
-    CRITICAL INSTRUCTION: Your primary goal is to TAILOR the resume to the exact JOB DESCRIPTION provided.
-    Do NOT lie or invent facts, but you MUST REFRAME, HIGHLIGHT, and PRIORITIZE the candidate's existing experience to match the keywords and requirements of the job.
-
-    Alignment rules:
-    1. If the job requires "developer experience", rewrite bullet points to emphasize programming, API development, and software engineering tasks.
-    2. If the job asks for "data loads and data quality", prioritize ETL, data pipelines, and validation tasks in the candidate's history.
-    3. The "Professional Summary" MUST explicitly state how the candidate's background solves the core needs mentioned in the Job Description.
-
-    Output Language: {idioma}
-
-    You MUST return a STRICTLY VALID JSON matching this structure:
-    {{
-      "nome": "Full Name",
-      "contatos": ["Phone", "Email", "LinkedIn"],
-      "resumo": "Highly tailored professional summary matching the job description.",
-      "experiencia": [
-        {{
-          "cargo": "Job Title",
-          "empresa": "Company Name",
-          "local": "Location",
-          "data": "Month Year - Month Year",
-          "atividades": ["Bullet point specifically adapted to highlight job description requirements", "Another tailored bullet point"]
-        }}
-      ],
-      "educacao": [
-        {{"curso": "Degree", "instituicao": "Institution", "local": "Location", "data": "Year", "detalhes": ["Detail"]}}
-      ],
-      "habilidades": [
-        {{"categoria": "Category", "itens": "Skill 1, Skill 2 (Prioritize skills mentioned in job description)"}}
-      ]
-    }}
-
-    CANDIDATE HISTORY:
-    {curriculo_base}
-
-    JOB DESCRIPTION:
-    {descricao_vaga}
-    """
+def gerar_curriculo_json(historico: str, vaga: str) -> dict:
+    prompt = f"HISTORICO:\n{historico}\n\nVAGA:\n{vaga}\n\nGere o JSON do curriculo."
 
     response = llm_client.models.generate_content(
-        model=MODEL_NAME,
+        model="gemini-2.5-flash",
         contents=prompt,
-        config=types.GenerateContentConfig(
+        config=genai.types.GenerateContentConfig(
+            system_instruction=_SYSTEM,
             response_mime_type="application/json",
-            temperature=0.3 
-        )
+            temperature=0.3,
+        ),
     )
-    return json.loads(response.text)
-
-def compilar_pdf_harvard(dados_cv: dict, idioma: str) -> io.BytesIO:
-    pdf = CurriculoHarvard()
-    pdf.cabecalho_candidato(dados_cv.get("nome", ""), dados_cv.get("contatos", []))
-
-    if dados_cv.get("resumo"):
-        pdf.titulo_secao("Professional Summary" if idioma == "English" else "Resumo Profissional")
-        pdf.paragrafo_resumo(dados_cv["resumo"])
-
-    if dados_cv.get("experiencia"):
-        pdf.titulo_secao("Experience" if idioma == "English" else "Experiência Profissional")
-        for exp in dados_cv["experiencia"]:
-            pdf.item_experiencia(exp.get("cargo", ""), exp.get("empresa", ""), exp.get("local", ""),
-                                 exp.get("data", ""), exp.get("atividades", []))
-
-    if dados_cv.get("educacao"):
-        pdf.titulo_secao("Education" if idioma == "English" else "Formação Acadêmica")
-        for edu in dados_cv["educacao"]:
-            pdf.item_experiencia(edu.get("curso", ""), edu.get("instituicao", ""), edu.get("local", ""),
-                                 edu.get("data", ""), edu.get("detalhes", []))
-
-    if dados_cv.get("habilidades"):
-        pdf.titulo_secao("Technical Skills" if idioma == "English" else "Habilidades Técnicas")
-        for hab in dados_cv["habilidades"]:
-            pdf.item_simples(hab.get("categoria", ""), hab.get("itens", ""))
-
-    buffer = io.BytesIO()
-    pdf.output(buffer)
-    buffer.seek(0)
-    return buffer
+    raw = response.text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    return json.loads(raw)
 
 # =========================================================
-# TELEGRAM HANDLERS
+# SUPABASE
 # =========================================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "Sistema ATS conectado ao banco de dados e nuvem.\n1. Envie seu .txt com histórico.\n2. Envie a descrição da vaga."
-    await update.message.reply_text(msg)
+def salvar_historico(telegram_id: int, raw_history: str):
+    db_client.table("user_profiles").upsert(
+        {"telegram_id": str(telegram_id), "raw_history": raw_history},
+        on_conflict="telegram_id"
+    ).execute()
 
-async def receber_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    documento = update.message.document
-    if not documento.file_name.endswith(".txt"):
-        await update.message.reply_text("Erro: Apenas arquivos .txt.")
+def buscar_historico(telegram_id: int) -> str | None:
+    r = (db_client.table("user_profiles")
+         .select("raw_history")
+         .eq("telegram_id", str(telegram_id))
+         .maybe_single()
+         .execute())
+    return r.data.get("raw_history") if r.data else None
+
+# =========================================================
+# HANDLERS
+# =========================================================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"[Handler] /start de user_id={update.effective_user.id}")
+    await update.message.reply_text(
+        "ATS Resume Bot - Pronto.\n\n"
+        "1. Envie um arquivo .txt com seu historico profissional.\n"
+        "2. Envie a descricao da vaga como texto.\n"
+        "3. Receba seu PDF no padrao Harvard.\n\n"
+        "Seu historico fica salvo para multiplas vagas."
+    )
+
+async def handle_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc     = update.message.document
+    user_id = update.effective_user.id
+    logger.info(f"[Handler] Documento de user_id={user_id}: {doc.file_name}")
+
+    if not doc.file_name.endswith(".txt"):
+        await update.message.reply_text("Envie um arquivo .txt com seu historico.")
         return
 
-    arquivo = await context.bot.get_file(documento.file_id)
-    conteudo_bytes = await arquivo.download_as_bytearray()
-    conteudo_str = conteudo_bytes.decode('utf-8')
-
-    telegram_id = update.effective_user.id
-    salvar_historico_supabase(telegram_id, conteudo_str)
-
-    await update.message.reply_text("Perfil salvo estruturalmente no banco de dados.")
-
-async def processar_vaga(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    descricao = update.message.text
-    telegram_id = update.effective_user.id
-
-    curriculo_base = recuperar_historico_supabase(telegram_id)
-
-    if not curriculo_base:
-        await update.message.reply_text("Histórico não encontrado no banco de dados. Envie o .txt primeiro.")
-        return
-
-    await update.message.reply_text("Analisando requisitos da vaga e realizando cross-match com seu perfil...")
+    await update.message.reply_text("Recebendo historico...")
 
     try:
-        idioma = detectar_idioma(descricao)
-        dados_json = gerar_dados_cv_json(descricao, curriculo_base, idioma)
-        dados_json = sanitizar_dados(dados_json)
-        arquivo_pdf = compilar_pdf_harvard(dados_json, idioma)
-
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=arquivo_pdf,
-            filename=f"CV_Tailored_{idioma}.pdf"
-        )
+        file = await context.bot.get_file(doc.file_id)
+        buf  = bytearray()
+        await file.download_as_bytearray(out=buf)
+        historico = buf.decode("utf-8")
     except Exception as e:
-        logger.exception("Falha na pipeline.")
-        await update.message.reply_text(f"Erro no processamento: {str(e)}")
+        logger.error(f"[Documento] Erro: {e}")
+        await update.message.reply_text("Falha ao ler arquivo. Use encoding UTF-8.")
+        return
+
+    try:
+        salvar_historico(user_id, historico)
+        logger.info(f"[Supabase] Historico salvo para {user_id}")
+    except Exception as e:
+        logger.error(f"[Supabase] Erro: {e}")
+        await update.message.reply_text("Falha ao salvar no banco. Tente novamente.")
+        return
+
+    await update.message.reply_text(
+        "Historico salvo!\nAgora envie a descricao da vaga para gerar o curriculo."
+    )
+
+async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id        = update.effective_user.id
+    descricao_vaga = update.message.text
+    logger.info(f"[Handler] Texto de user_id={user_id}: {descricao_vaga[:60]}")
+
+    historico = buscar_historico(user_id)
+    if not historico:
+        await update.message.reply_text(
+            "Nenhum historico encontrado.\n"
+            "Envie primeiro um arquivo .txt com seu historico."
+        )
+        return
+
+    msg = await update.message.reply_text("Analisando perfil... Aguarde.")
+
+    try:
+        dados = gerar_curriculo_json(historico, descricao_vaga)
+    except json.JSONDecodeError as e:
+        logger.error(f"[Gemini] JSON invalido: {e}")
+        await msg.edit_text("Modelo retornou resposta invalida. Tente novamente.")
+        return
+    except Exception as e:
+        logger.error(f"[Gemini] Erro: {e}")
+        await msg.edit_text("Falha no modelo de IA. Tente novamente.")
+        return
+
+    try:
+        pdf_buf = gerar_pdf(dados)
+    except Exception as e:
+        logger.error(f"[PDF] Erro: {e}")
+        await msg.edit_text("Falha ao gerar PDF.")
+        return
+
+    nome         = dados.get("contato", {}).get("nome", "Candidato")
+    nome_arquivo = f"CV_{nome.replace(' ', '_')}_ATS.pdf"
+
+    await msg.edit_text("Compilando PDF...")
+    await update.message.reply_document(
+        document=pdf_buf,
+        filename=nome_arquivo,
+        caption=f"Curriculo ATS gerado: {nome}\nEnvie outra vaga para gerar novamente.",
+    )
+    await msg.delete()
+
+async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"[Erro] {context.error}", exc_info=context.error)
 
 # =========================================================
-# MAIN
+# MAIN — POLLING (funciona no Render.com)
 # =========================================================
 def main():
-    logger.info("Iniciando thread do servidor HTTP fantasma na porta 7860...")
-    threading.Thread(target=iniciar_servidor_web, daemon=True).start()
+    logger.info("=" * 60)
+    logger.info("Iniciando ATS Resume Bot")
+    logger.info("=" * 60)
 
-    logger.info("Inicializando os serviços do bot do Telegram...")
-    # Timouts aumentados para lidar com instabilidades de rede e ambientes conteinerizados
+    # Thread keep-alive para health check do Render
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # Motor HTTP com timeouts altos e HTTP/1.1 forçado
+    # para estabilizar TLS em nós de nuvem
+    custom_request = HTTPXRequest(
+        connect_timeout=60.0,
+        read_timeout=60.0,
+        http_version="1.1",
+    )
+
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
+        .request(custom_request)
         .build()
     )
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, receber_documento))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, processar_vaga))
-    
-    logger.info("Serviço do bot em execução.")
-    app.run_polling(drop_pending_updates=True)
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_documento))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_texto))
+    app.add_error_handler(handle_erro)
+
+    logger.info("Bot em modo de escuta (polling)...")
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
+
 
 if __name__ == "__main__":
     main()
