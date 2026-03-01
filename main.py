@@ -169,44 +169,48 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
     pdf.output(buf)
     buf.seek(0)
     return buf
-
 # =========================================================
 # LOGICA LLM (ROTEAMENTO E GERACAO)
 # =========================================================
 def classificar_intencao_llm(texto):
     p = f"Responda 'VAGA' se o texto for descricao de cargo, ou 'HISTORICO' se for perfil/curriculo:\n\n{texto[:1000]}"
-    resp = llm_client.models.generate_content(model="gemini-2.5-flash", contents=p)
+    resp = llm_client.models.generate_content(model="gemma-3-27b-it", contents=p)
     return "VAGA" if "VAGA" in resp.text.upper() else "HISTORICO"
 
 def consolidar_historico_llm(atual, novo):
     p = f"Mescle as novas informacoes ao historico atual, removendo duplicatas e mantendo consistencia. Retorne apenas o texto consolidado:\n\nATUAL:\n{atual}\n\nNOVA:\n{novo}"
-    return llm_client.models.generate_content(model="gemini-2.5-flash", contents=p).text.strip()
+    return llm_client.models.generate_content(model="gemma-3-27b-it", contents=p).text.strip()
 
 _SCHEMA = '{"contato": {"nome":"","email":"","telefone":"","linkedin":""}, "resumo": "", "experiencias": [{"cargo":"","empresa":"","periodo":"","conquistas":[]}], "educacao": [], "competencias": [], "idiomas": []}'
 
 def gerar_curriculo_json(hist, vaga, perfil):
+    # A instrucao de sistema foi movida para o prompt principal para garantir compatibilidade com a arquitetura Gemma
     p = (
+        f"INSTRUCAO: Voce e um recrutador tecnico senior especialista em curriculos ATS no padrao Harvard. "
+        f"Gere um JSON estruturado. Retorne SOMENTE o objeto JSON puro sem blocos Markdown. "
+        f"Schema exigido: {_SCHEMA}\n\n"
         f"HISTORICO:\n{hist}\n\n"
         f"VAGA:\n{vaga}\n\n"
-        f"IDIOMA: {perfil.get('idioma')}\n"
-        f"CONTATOS: {perfil.get('email')}, {perfil.get('telefone')}, {perfil.get('linkedin')}"
+        f"IDIOMA DE SAIDA: {perfil.get('idioma')}\n"
+        f"CONTATOS OBRIGATORIOS: Email: {perfil.get('email')}, Telefone: {perfil.get('telefone')}, LinkedIn: {perfil.get('linkedin')}"
     )
+    
     resp = llm_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemma-3-27b-it",
         contents=p,
         config=genai.types.GenerateContentConfig(
-            system_instruction=f"Gere um JSON ATS no padrao Harvard. SOMENTE JSON PURO sem delimitadores Markdown. Schema: {_SCHEMA}",
             response_mime_type="application/json",
             temperature=0.1
         )
     )
     
+    # Limpeza rigorosa de strings via Regex para tratar respostas brutas do Gemma
     texto_json = resp.text.strip()
     texto_json = re.sub(r'^```json', '', texto_json, flags=re.IGNORECASE)
+    texto_json = re.sub(r'^```', '', texto_json)
     texto_json = re.sub(r'```$', '', texto_json).strip()
     
     return json.loads(texto_json)
-
 # =========================================================
 # BANCO DE DADOS E HANDLERS
 # =========================================================
