@@ -199,8 +199,8 @@ def gerar_curriculo_json(hist, vaga, perfil):
         model="gemma-3-27b-it",
         contents=p,
         config=genai.types.GenerateContentConfig(
-            response_mime_type="application/json",
             temperature=0.1
+            # O parametro response_mime_type foi removido pois Gemma nao o suporta nativamente.
         )
     )
     
@@ -209,6 +209,8 @@ def gerar_curriculo_json(hist, vaga, perfil):
     texto_json = re.sub(r'^```json', '', texto_json, flags=re.IGNORECASE)
     texto_json = re.sub(r'^```', '', texto_json)
     texto_json = re.sub(r'```$', '', texto_json).strip()
+    
+    return json.loads(texto_json)
     
     return json.loads(texto_json)
 # =========================================================
