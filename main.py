@@ -36,10 +36,10 @@ SUPABASE_URL    = os.getenv("SUPABASE_URL",    "").strip()
 SUPABASE_KEY    = os.getenv("SUPABASE_KEY",    "").strip()
 
 if not all([TELEGRAM_TOKEN, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
-    logger.error("ERRO CRÍTICO: Variáveis de ambiente ausentes.")
+    logger.error("ERRO CRITICO: Variaveis de ambiente ausentes.")
     raise SystemExit(1)
 
-# Inicialização de Clientes
+# Inicializacao de Clientes
 llm_client: genai.Client = genai.Client(api_key=GEMINI_API_KEY)
 db_client:  Client       = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -60,13 +60,12 @@ def start_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # =========================================================
-# UTILITÁRIOS: PDF E EXTRAÇÃO DE TEXTO
+# UTILITARIOS: PDF E EXTRACAO DE TEXTO
 # =========================================================
 _SUBS = {"\u2022": "-", "\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u00b7": "-", "\u2026": "..."}
 
 def sanitize(text: str) -> str:
     if not text: return ""
-    # Substitui caracteres problemáticos e tabs por espaços
     text = str(text).replace("\t", " ")
     for char, rep in _SUBS.items():
         text = text.replace(char, rep)
@@ -95,40 +94,36 @@ class CurriculoHarvard(FPDF):
         super().__init__()
         self.set_margins(20, 20, 20)
         self.add_page()
-        self.set_auto_page_break(True, 15)
+        self.set_auto_page_break(True, margin=15)
 
     def cabecalho_candidato(self, d: dict):
-        self.set_font("Helvetica", "B", 16)
-        # Substitui cell por multi_cell para garantir wrap seguro em nomes muito longos
+        self.set_font("helvetica", "B", 16)
         self.multi_cell(0, 10, sanitize(d.get("nome", "Candidato")), align="C")
         
         partes = [v for k, v in d.items() if k != "nome" and v and isinstance(v, str)]
         if partes:
-            self.set_font("Helvetica", "", 10)
+            self.set_font("helvetica", "", 10)
             self.multi_cell(0, 6, sanitize(" | ".join(partes)), align="C")
         self.ln(4)
 
     def secao(self, titulo):
-        self.set_font("Helvetica", "B", 12)
+        self.set_font("helvetica", "B", 12)
         self.cell(0, 8, sanitize(titulo.upper()), new_x="LMARGIN", new_y="NEXT")
-        self.line(20, self.get_y(), 190, self.get_y())
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
         self.ln(2)
 
     def item_experiencia(self, exp: dict):
         if not isinstance(exp, dict): return
-        self.set_font("Helvetica", "B", 11)
-        # Multi_cell garante que cargos/empresas gigantes quebrem a linha automaticamente
+        self.set_font("helvetica", "B", 11)
         self.multi_cell(0, 6, sanitize(f"{exp.get('cargo','')} -- {exp.get('empresa','')}"))
         
-        self.set_font("Helvetica", "I", 10)
+        self.set_font("helvetica", "I", 10)
         self.multi_cell(0, 5, sanitize(exp.get("periodo", "")))
         
-        self.set_font("Helvetica", "", 10)
+        self.set_font("helvetica", "", 10)
         conquistas = exp.get("conquistas", [])
         
-        # Blindagem: Se o LLM gerar uma string em vez de lista, converte para lista
         if isinstance(conquistas, str): conquistas = [conquistas]
-        
         if isinstance(conquistas, list):
             for b in conquistas:
                 if b: self.multi_cell(0, 5, sanitize(f"- {b}"))
@@ -141,7 +136,7 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
     
     if dados.get("resumo"):
         pdf.secao("Resumo Profissional")
-        pdf.set_font("Helvetica", "", 10)
+        pdf.set_font("helvetica", "", 10)
         pdf.multi_cell(0, 5, sanitize(dados["resumo"]))
         pdf.ln(2)
 
@@ -154,9 +149,9 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
                 if chave == "experiencias": 
                     pdf.item_experiencia(item)
                 else:
-                    pdf.set_font("Helvetica", "B", 11)
+                    pdf.set_font("helvetica", "B", 11)
                     pdf.multi_cell(0, 6, sanitize(item.get("curso", "")))
-                    pdf.set_font("Helvetica", "", 10)
+                    pdf.set_font("helvetica", "", 10)
                     pdf.multi_cell(0, 5, sanitize(f"{item.get('instituicao','')} | {item.get('periodo','')}"))
                     pdf.ln(2)
 
@@ -165,7 +160,7 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
         if isinstance(lista, str): lista = [lista]
         if lista and isinstance(lista, list):
             pdf.secao(tit)
-            pdf.set_font("Helvetica", "", 10)
+            pdf.set_font("helvetica", "", 10)
             for i in lista: 
                 if i: pdf.multi_cell(0, 5, sanitize(f"- {i}"))
 
@@ -175,7 +170,7 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
     return buf
 
 # =========================================================
-# LÓGICA LLM (ROTEAMENTO E GERAÇÃO)
+# LOGICA LLM (ROTEAMENTO E GERACAO)
 # =========================================================
 def classificar_intencao_llm(texto):
     p = f"Responda 'VAGA' se o texto for descricao de cargo, ou 'HISTORICO' se for perfil/curriculo:\n\n{texto[:1000]}"
@@ -189,19 +184,27 @@ def consolidar_historico_llm(atual, novo):
 _SCHEMA = '{"contato": {"nome":"","email":"","telefone":"","linkedin":""}, "resumo": "", "experiencias": [{"cargo":"","empresa":"","periodo":"","conquistas":[]}], "educacao": [], "competencias": [], "idiomas": []}'
 
 def gerar_curriculo_json(hist, vaga, perfil):
-    p = f"HISTORICO:\n{hist}\n\nVAGA:\n{vaga}\n\nIDIOMA: {perfil.get('idioma')}\nCONTATOS: {perfil.get('email')}, {perfil.get('telefone')}, {perfil.get('linkedin')}"
+    p = (
+        f"HISTORICO:\n{hist}\n\n"
+        f"VAGA:\n{vaga}\n\n"
+        f"IDIOMA: {perfil.get('idioma')}\n"
+        f"CONTATOS: {perfil.get('email')}, {perfil.get('telefone')}, {perfil.get('linkedin')}"
+    )
     resp = llm_client.models.generate_content(
         model="gemini-2.5-flash",
         contents=p,
         config=genai.types.GenerateContentConfig(
-            system_instruction=f"Gere um JSON ATS no padrao Harvard. SOMENTE JSON PURO. Schema: {_SCHEMA}",
+            system_instruction=f"Gere um JSON ATS no padrao Harvard. SOMENTE JSON PURO sem delimitadores Markdown. Schema: {_SCHEMA}",
             response_mime_type="application/json",
             temperature=0.1
         )
     )
-    # Limpeza de JSON
-    t = re.sub(r'```json|```', '', resp.text).strip()
-    return json.loads(t)
+    
+    texto_json = resp.text.strip()
+    texto_json = re.sub(r'^```json', '', texto_json, flags=re.IGNORECASE)
+    texto_json = re.sub(r'```$', '', texto_json).strip()
+    
+    return json.loads(texto_json)
 
 # =========================================================
 # BANCO DE DADOS E HANDLERS
@@ -231,7 +234,7 @@ async def ask_phone(u, c): c.user_data['t'] = u.message.text; await u.message.re
 async def ask_linkedin(u, c): c.user_data['l'] = u.message.text; await u.message.reply_text("Idioma padrao (Ex: Portugues)?"); return ASK_LANGUAGE
 async def ask_language(u, c):
     salvar_perfil(u.effective_user.id, {"email": c.user_data['e'], "telefone": c.user_data['t'], "linkedin": c.user_data['l'], "idioma": u.message.text})
-    await u.message.reply_text("Perfil salvo! O bot aceita agora envio de textos, atualizações ou PDFs.")
+    await u.message.reply_text("Perfil salvo! O bot aceita agora envio de textos, atualizacoes ou PDFs.")
     return ConversationHandler.END
 
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -269,6 +272,9 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nome = dados.get("contato", {}).get("nome", "Candidato").replace(" ", "_")
             await update.message.reply_document(document=pdf, filename=f"CV_{nome}_ATS.pdf")
             await status.delete()
+        except json.JSONDecodeError as e:
+            logger.error(f"Erro JSON: {e}")
+            await status.edit_text("Falha ao formatar os dados. O modelo gerou um documento invalido. Tente enviar novamente.")
         except Exception as e:
             logger.error(f"Erro: {e}", exc_info=True)
             await status.edit_text("Erro ao gerar PDF.")
