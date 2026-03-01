@@ -96,7 +96,6 @@ def extrair_texto_de_arquivo(file_bytes: bytearray, filename: str) -> str:
             logger.error(f"Erro ao extrair PDF: {e}")
             raise Exception("Falha na extração do PDF.")
     else:
-        # Tenta múltiplas codificações para suportar arquivos do Windows
         encodings = ["utf-8", "utf-16", "latin-1", "cp1252"]
         for enc in encodings:
             try:
@@ -106,7 +105,7 @@ def extrair_texto_de_arquivo(file_bytes: bytearray, filename: str) -> str:
         return file_bytes.decode("utf-8", errors="ignore")
 
 # =========================================================
-# GERADOR DE PDF — PADRAO HARVARD
+# GERADOR DE PDF — PADRAO HARVARD (BLINDADO)
 # =========================================================
 class CurriculoHarvard(FPDF):
     def __init__(self):
@@ -117,13 +116,13 @@ class CurriculoHarvard(FPDF):
 
     def cabecalho_candidato(self, dados: dict):
         self.set_font("Arial", "B", 16)
-        self.cell(0, 10, sanitize(dados.get("nome", "")),
-                  new_x="LMARGIN", new_y="NEXT", align="C")
-        partes = [v for k, v in dados.items() if k != "nome" and v]
+        nome = dados.get("nome") or "Candidato"
+        self.cell(0, 10, sanitize(nome), new_x="LMARGIN", new_y="NEXT", align="C")
+        
+        partes = [v for k, v in dados.items() if k != "nome" and v and isinstance(v, str)]
         if partes:
             self.set_font("Arial", "", 10)
-            self.cell(0, 6, sanitize(" | ".join(partes)),
-                      new_x="LMARGIN", new_y="NEXT", align="C")
+            self.cell(0, 6, sanitize(" | ".join(partes)), new_x="LMARGIN", new_y="NEXT", align="C")
         self.ln(4)
 
     def secao(self, titulo: str):
@@ -133,62 +132,70 @@ class CurriculoHarvard(FPDF):
         self.ln(2)
 
     def item_experiencia(self, exp: dict):
+        if not isinstance(exp, dict): return
         self.set_font("Arial", "B", 11)
-        self.cell(0, 6,
-                  sanitize(f"{exp.get('cargo','')} -- {exp.get('empresa','')}"),
-                  new_x="LMARGIN", new_y="NEXT")
+        header = f"{exp.get('cargo','')} -- {exp.get('empresa','')}"
+        self.cell(0, 6, sanitize(header), new_x="LMARGIN", new_y="NEXT")
         self.set_font("Arial", "I", 10)
         self.cell(0, 5, sanitize(exp.get("periodo", "")), new_x="LMARGIN", new_y="NEXT")
         self.ln(1)
         self.set_font("Arial", "", 10)
-        for b in exp.get("conquistas", []):
-            self.multi_cell(0, 5, sanitize(f"- {b}"))
+        conquistas = exp.get("conquistas", [])
+        if isinstance(conquistas, list):
+            for b in conquistas:
+                self.multi_cell(0, 5, sanitize(f"- {b}"))
         self.ln(3)
 
     def item_educacao(self, edu: dict):
+        if not isinstance(edu, dict): return
         self.set_font("Arial", "B", 11)
         self.cell(0, 6, sanitize(edu.get("curso", "")), new_x="LMARGIN", new_y="NEXT")
         self.set_font("Arial", "", 10)
-        self.cell(0, 5,
-                  sanitize(f"{edu.get('instituicao','')} | {edu.get('periodo','')}"),
-                  new_x="LMARGIN", new_y="NEXT")
+        info = f"{edu.get('instituicao','')} | {edu.get('periodo','')}"
+        self.cell(0, 5, sanitize(info), new_x="LMARGIN", new_y="NEXT")
         self.ln(3)
 
     def bloco_texto(self, texto: str):
         self.set_font("Arial", "", 10)
-        self.multi_cell(0, 5, sanitize(texto))
+        self.multi_cell(0, 5, sanitize(str(texto)))
         self.ln(3)
 
     def lista_simples(self, itens: list):
         self.set_font("Arial", "", 10)
-        for item in itens:
-            self.multi_cell(0, 5, sanitize(f"- {item}"))
+        if isinstance(itens, list):
+            for item in itens:
+                self.multi_cell(0, 5, sanitize(f"- {item}"))
         self.ln(3)
 
 def gerar_pdf(dados: dict) -> io.BytesIO:
+    if not isinstance(dados, dict): dados = {}
     pdf = CurriculoHarvard()
-    pdf.cabecalho_candidato(dados.get("contato", {}))
+    
+    contato = dados.get("contato")
+    if not isinstance(contato, dict): contato = {}
+    pdf.cabecalho_candidato(contato)
 
     if dados.get("resumo"):
         pdf.secao("Resumo Profissional")
         pdf.bloco_texto(dados["resumo"])
-    if dados.get("experiencias"):
+        
+    exps = dados.get("experiencias")
+    if isinstance(exps, list) and exps:
         pdf.secao("Experiencia Profissional")
-        for exp in dados["experiencias"]:
-            pdf.item_experiencia(exp)
-    if dados.get("educacao"):
+        for exp in exps: pdf.item_experiencia(exp)
+        
+    edus = dados.get("educacao")
+    if isinstance(edus, list) and edus:
         pdf.secao("Formacao Academica")
-        for edu in dados["educacao"]:
-            pdf.item_educacao(edu)
-    if dados.get("competencias"):
-        pdf.secao("Competencias Tecnicas")
-        pdf.lista_simples(dados["competencias"])
-    if dados.get("certificacoes"):
-        pdf.secao("Certificacoes")
-        pdf.lista_simples(dados["certificacoes"])
-    if dados.get("idiomas"):
-        pdf.secao("Idiomas")
-        pdf.lista_simples(dados["idiomas"])
+        for edu in edus: pdf.item_educacao(edu)
+        
+    for secao_nome, chave in [("Competencias Tecnicas", "competencias"), 
+                             ("Certificacoes", "certificacoes"), 
+                             ("Idiomas", "idiomas")]:
+        lista = dados.get(chave)
+        if isinstance(lista, list) and lista:
+            pdf.secao(secao_nome)
+            pdf.lista_simples(lista)
 
     buf = io.BytesIO()
     pdf.output(buf)
@@ -196,15 +203,13 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
     return buf
 
 # =========================================================
-# MOTORES LLM (ROTEADOR, CONSOLIDADOR E GERADOR)
+# MOTORES LLM
 # =========================================================
 def classificar_intencao_llm(texto: str) -> str:
     prompt = (
-        "Analise o texto fornecido e determine a intencao do usuario. "
-        "Se o texto contiver um curriculo, historico profissional, instrucoes para adicionar/remover competencias, "
-        "ou atualizacoes de carreira, responda estritamente com a palavra 'HISTORICO'. "
-        "Se o texto for a descricao de uma vaga de emprego, listando requisitos de contratacao, "
-        "responda estritamente com a palavra 'VAGA'.\n\n"
+        "Analise o texto e determine a intencao. "
+        "Se for curriculo, historico ou atualizacao de carreira, responda 'HISTORICO'. "
+        "Se for descricao de vaga/requisitos, responda 'VAGA'.\n\n"
         f"TEXTO:\n{texto[:1500]}"
     )
     response = llm_client.models.generate_content(
@@ -216,14 +221,10 @@ def classificar_intencao_llm(texto: str) -> str:
 
 def consolidar_historico_llm(historico_atual: str, nova_interacao: str) -> str:
     prompt = (
-        "Voce atua como um sistema de banco de dados de curriculos. O usuario enviou uma nova informacao ou instrucao.\n\n"
-        f"HISTORICO ATUAL SALVO:\n{historico_atual}\n\n"
-        f"NOVA INTERACAO DO USUARIO:\n{nova_interacao}\n\n"
-        "Sua tarefa: Reescreva o historico atual incorporando a nova interacao. "
-        "Se a nova interacao for um curriculo novo, substitua e complemente. "
-        "Se for uma instrucao (ex: 'adicione que falo ingles'), aplique a mudanca. "
-        "Se for uma instrucao de exclusao, remova os dados. "
-        "Nao invente dados. Retorne APENAS o texto do historico consolidado, sem introducoes ou comentarios adicionais."
+        "Reescreva o historico incorporando a nova interacao. "
+        "Mantenha os dados antigos e adicione/atualize com os novos. "
+        "Retorne APENAS o texto consolidado.\n\n"
+        f"ATUAL:\n{historico_atual}\n\nNOVA:\n{nova_interacao}"
     )
     response = llm_client.models.generate_content(
         model="gemini-2.5-flash",
@@ -234,261 +235,131 @@ def consolidar_historico_llm(historico_atual: str, nova_interacao: str) -> str:
 
 _SCHEMA = """{
   "contato": {"nome":"","email":"","telefone":"","linkedin":"","cidade":""},
-  "resumo": "2-4 frases de impacto alinhadas a vaga",
-  "experiencias": [{"cargo":"","empresa":"","periodo":"","conquistas":["verbo + metrica"]}],
+  "resumo": "frases de impacto",
+  "experiencias": [{"cargo":"","empresa":"","periodo":"","conquistas":[]}],
   "educacao": [{"curso":"","instituicao":"","periodo":""}],
-  "competencias": [""],
-  "certificacoes": [""],
-  "idiomas": ["Idioma - Nivel"]
+  "competencias": [], "certificacoes": [], "idiomas": []
 }"""
 
-_SYSTEM = (
-    "Voce e um recrutador tecnico senior especialista em curriculos ATS no padrao Harvard.\n"
-    "REGRAS: Retorne SOMENTE JSON valido sem markdown. "
-    f"Schema: {_SCHEMA}. "
-    "Nunca invente dados. Use apenas ASCII (sem acentos). "
-    "Campos sem info: string vazia ou lista vazia."
-)
-
 def gerar_curriculo_json(historico: str, vaga: str, perfil: dict) -> dict:
-    idioma = perfil.get('idioma', 'Ingles')
-    email = perfil.get('email', '')
-    telefone = perfil.get('telefone', '')
-    linkedin = perfil.get('linkedin', '')
-
     prompt = (
-        f"HISTORICO:\n{historico}\n\n"
-        f"VAGA:\n{vaga}\n\n"
-        f"INSTRUCOES OBRIGATORIAS:\n"
-        f"1. O curriculo DEVE ser traduzido e gerado estritamente no idioma: {idioma}.\n"
-        f"2. Preencha os dados de contato EXATAMENTE com os seguintes valores:\n"
-        f"   - Email: {email}\n"
-        f"   - Telefone: {telefone}\n"
-        f"   - LinkedIn: {linkedin}\n\n"
-        f"Gere o JSON do curriculo respeitando o idioma e substituindo os placeholders."
+        f"HISTORICO:\n{historico}\n\nVAGA:\n{vaga}\n\n"
+        f"IDIOMA OBRIGATORIO: {perfil.get('idioma', 'Ingles')}\n"
+        f"DADOS DE CONTATO: Email: {perfil.get('email')}, Tel: {perfil.get('telefone')}, LinkedIn: {perfil.get('linkedin')}\n"
+        "Gere o JSON ATS seguindo o schema."
     )
-
     response = llm_client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
         config=genai.types.GenerateContentConfig(
-            system_instruction=_SYSTEM,
+            system_instruction=f"Recrutador Harvard. Retorne SOMENTE JSON. Schema: {_SCHEMA}",
             response_mime_type="application/json",
             temperature=0.3,
         ),
     )
-    raw = response.text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    return json.loads(raw)
+    return json.loads(response.text)
 
 # =========================================================
 # SUPABASE
 # =========================================================
-def salvar_historico(telegram_id: int, raw_history: str):
-    db_client.table("user_profiles").upsert(
-        {"telegram_id": str(telegram_id), "raw_history": raw_history},
-        on_conflict="telegram_id"
-    ).execute()
-
 def salvar_perfil(telegram_id: int, dados: dict):
     dados["telegram_id"] = str(telegram_id)
-    db_client.table("user_profiles").upsert(
-        dados,
-        on_conflict="telegram_id"
-    ).execute()
+    db_client.table("user_profiles").upsert(dados, on_conflict="telegram_id").execute()
 
 def buscar_usuario(telegram_id: int) -> dict | None:
     try:
-        r = (db_client.table("user_profiles")
-             .select("*")
-             .eq("telegram_id", str(telegram_id))
-             .execute())
-        
-        # Verifica com segurança se a propriedade data existe e não está vazia
-        if hasattr(r, 'data') and isinstance(r.data, list) and len(r.data) > 0:
-            return r.data[0]
-            
-    except Exception as e:
-        logger.error(f"[Supabase] Falha ao buscar usuario {telegram_id}: {e}")
-        
+        r = db_client.table("user_profiles").select("*").eq("telegram_id", str(telegram_id)).execute()
+        if hasattr(r, 'data') and len(r.data) > 0: return r.data[0]
+    except Exception as e: logger.error(f"Erro buscar_usuario: {e}")
     return None
+
 # =========================================================
-# HANDLERS DO FLUXO DE CADASTRO
+# HANDLERS
 # =========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"[Handler] /start de user_id={user_id}")
-    
     usuario = buscar_usuario(user_id)
-    
-    if usuario and usuario.get("email") and usuario.get("idioma"):
-        await update.message.reply_text(
-            "Seu perfil ja esta configurado.\n"
-            "Voce pode colar textos no chat ou enviar arquivos (.txt, .pdf).\n"
-            "O sistema determinara automaticamente se voce esta atualizando o seu perfil ou solicitando uma vaga."
-        )
+    if usuario and usuario.get("email"):
+        await update.message.reply_text("Perfil configurado. Envie seu historico ou uma vaga.")
         return ConversationHandler.END
-
-    await update.message.reply_text(
-        "Bem-vindo ao ATS Resume Bot.\n"
-        "Vamos configurar seu perfil para nao precisarmos perguntar novamente nas proximas vagas.\n\n"
-        "Qual o seu E-MAIL profissional?"
-    )
+    await update.message.reply_text("Bem-vindo! Qual o seu E-MAIL profissional?")
     return ASK_EMAIL
 
 async def ask_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['email'] = update.message.text
-    await update.message.reply_text("Qual o seu numero de TELEFONE (com DDD)?")
+    await update.message.reply_text("Qual o seu TELEFONE?")
     return ASK_PHONE
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['telefone'] = update.message.text
-    await update.message.reply_text("Qual a URL ou o usuario do seu LINKEDIN?")
+    await update.message.reply_text("Qual seu LINKEDIN?")
     return ASK_LINKEDIN
 
 async def ask_linkedin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['linkedin'] = update.message.text
-    await update.message.reply_text(
-        "Em qual IDIOMA os curriculos devem ser gerados como padrao? (Ex: Ingles, Portugues, Espanhol)"
-    )
+    await update.message.reply_text("Idioma padrao (Ex: Ingles, Portugues)?")
     return ASK_LANGUAGE
 
 async def ask_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['idioma'] = update.message.text
     user_id = update.effective_user.id
-    
     dados = {
-        "email": context.user_data['email'],
-        "telefone": context.user_data['telefone'],
-        "linkedin": context.user_data['linkedin'],
-        "idioma": context.user_data['idioma']
+        "email": context.user_data['email'], "telefone": context.user_data['telefone'],
+        "linkedin": context.user_data['linkedin'], "idioma": update.message.text
     }
-    
-    try:
-        salvar_perfil(user_id, dados)
-        await update.message.reply_text(
-            "Perfil salvo com sucesso!\n\n"
-            "O bot trabalha de forma automatica e contextual. Voce pode colar seu historico profissional "
-            "ou a descricao de uma vaga de emprego a qualquer momento. O sistema sabera o que fazer."
-        )
-    except Exception as e:
-        logger.error(f"[Cadastro] Erro ao salvar perfil: {e}")
-        await update.message.reply_text("Erro interno. Tente novamente com /start.")
-    
+    salvar_perfil(user_id, dados)
+    await update.message.reply_text("Perfil salvo! Envie seu historico (.pdf, .txt ou texto).")
     return ConversationHandler.END
 
-# =========================================================
-# HANDLER UNIFICADO DE PROCESSAMENTO DE CONTEXTO
-# =========================================================
 async def handle_input_inteligente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     usuario = buscar_usuario(user_id)
-    
     if not usuario or not usuario.get("email"):
-        await update.message.reply_text("Processo recusado. Conclua seu cadastro basico enviando o comando /start.")
+        await update.message.reply_text("Use /start primeiro.")
         return
 
     texto_extraido = ""
-    msg_status = await update.message.reply_text("Recebendo dados...")
+    status = await update.message.reply_text("Processando...")
 
-    # Extração de dados (Suporta Arquivos TXT, PDF ou Texto Direto)
     if update.message.document:
         doc = update.message.document
-        if not doc.file_name.lower().endswith(('.txt', '.pdf')):
-            await msg_status.edit_text("Formato invalido. Envie apenas .txt ou .pdf.")
-            return
-        try:
-            file = await context.bot.get_file(doc.file_id)
-            buf = bytearray()
-            await file.download_as_bytearray(out=buf)
-            texto_extraido = extrair_texto_de_arquivo(buf, doc.file_name)
-        except Exception as e:
-            logger.error(f"[Documento] Erro extração: {e}")
-            await msg_status.edit_text("Falha ao extrair texto do arquivo submetido.")
-            return
-    elif update.message.text:
+        file = await context.bot.get_file(doc.file_id)
+        buf = bytearray()
+        await file.download_as_bytearray(out=buf)
+        texto_extraido = extrair_texto_de_arquivo(buf, doc.file_name)
+    else:
         texto_extraido = update.message.text
 
-    if not texto_extraido.strip():
-        await msg_status.edit_text("Nenhum texto detectado para processamento.")
-        return
-
-    await msg_status.edit_text("Classificando contexto da requisicao...")
     intencao = classificar_intencao_llm(texto_extraido)
 
-    # Fluxo 1: Atualização de Histórico
     if intencao == "HISTORICO":
-        await msg_status.edit_text("Atualizando a sua base de dados profissional...")
-        historico_atual = usuario.get("raw_history", "")
-        
-        if historico_atual:
-            historico_atualizado = consolidar_historico_llm(historico_atual, texto_extraido)
-        else:
-            historico_atualizado = texto_extraido
-
-        try:
-            salvar_historico(user_id, historico_atualizado)
-            await msg_status.edit_text("Contexto profissional processado e salvo. O bot esta pronto para receber a vaga de emprego.")
-        except Exception as e:
-            logger.error(f"[Supabase] Erro ao salvar historico: {e}")
-            await msg_status.edit_text("Falha na persistencia dos dados.")
-
-    # Fluxo 2: Geração de Currículo para Vaga
-    elif intencao == "VAGA":
-        historico_atual = usuario.get("raw_history")
-        if not historico_atual:
-            await msg_status.edit_text("Nenhum historico de carreira encontrado no sistema. Envie os seus dados primeiro.")
+        historico_atualizado = consolidar_historico_llm(usuario.get("raw_history", ""), texto_extraido)
+        salvar_perfil(user_id, {"raw_history": historico_atualizado})
+        await status.edit_text("Historico atualizado com sucesso!")
+    else:
+        if not usuario.get("raw_history"):
+            await status.edit_text("Envie seu historico primeiro.")
             return
-
-        await msg_status.edit_text("Contexto de vaga identificado. Estruturando documento otimizado...")
         try:
-            dados = gerar_curriculo_json(historico_atual, texto_extraido, usuario)
+            dados = gerar_curriculo_json(usuario["raw_history"], texto_extraido, usuario)
             pdf_buf = gerar_pdf(dados)
-        except json.JSONDecodeError:
-            await msg_status.edit_text("Falha na geracao da estrutura ATS. Requisite novamente.")
-            return
+            nome = dados.get("contato", {}).get("nome") or "CV"
+            await update.message.reply_document(document=pdf_buf, filename=f"{nome}_ATS.pdf")
+            await status.delete()
         except Exception as e:
-            logger.error(f"[Geracao] Erro: {e}")
-            await msg_status.edit_text("Erro critico de geracao.")
-            return
-
-        nome_arquivo = f"CV_{dados.get('contato', {}).get('nome', 'Candidato').replace(' ', '_')}_ATS.pdf"
-        await msg_status.edit_text("Concluido. Enviando PDF...")
-        await update.message.reply_document(
-            document=pdf_buf,
-            filename=nome_arquivo,
-            caption=f"Processo finalizado. Idioma aplicado: {usuario.get('idioma')}."
-        )
-        await msg_status.delete()
+            logger.error(f"Erro geracao: {e}", exc_info=True)
+            await status.edit_text("Erro ao gerar curriculo.")
 
 async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"[Erro Global] {context.error}", exc_info=context.error)
+    logger.error(f"Erro Global: {context.error}")
 
 # =========================================================
-# MAIN — POLLING
+# MAIN
 # =========================================================
 def main():
-    logger.info("=" * 60)
-    logger.info("Iniciando ATS Resume Bot")
-    logger.info("=" * 60)
-
     threading.Thread(target=start_health_server, daemon=True).start()
-
-    custom_request = HTTPXRequest(
-        connect_timeout=60.0,
-        read_timeout=60.0,
-        http_version="1.1",
-    )
-
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .request(custom_request)
-        .build()
-    )
-
-    conv_handler = ConversationHandler(
+    app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connect_timeout=60, read_timeout=60)).build()
+    
+    conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
             ASK_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_email)],
@@ -499,17 +370,10 @@ def main():
         fallbacks=[CommandHandler("start", cmd_start)],
     )
 
-    app.add_handler(conv_handler)
-    # Direciona documentos (TXT, PDF) e mensagens de texto puro para o analisador inteligente
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_input_inteligente))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_inteligente))
+    app.add_handler(conv)
+    app.add_handler(MessageHandler(filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), handle_input_inteligente))
     app.add_error_handler(handle_erro)
-
-    logger.info("Sistema ativo aguardando requisicoes.")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
