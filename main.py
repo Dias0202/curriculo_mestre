@@ -98,12 +98,13 @@ class CurriculoHarvard(FPDF):
 
     def cabecalho_candidato(self, d: dict):
         self.set_font("helvetica", "B", 16)
-        self.multi_cell(0, 10, sanitize(d.get("nome", "Candidato")), align="C")
+        # O reset de cursor (new_x, new_y) é obrigatório no fpdf2 para evitar o erro de falta de espaço
+        self.multi_cell(0, 10, sanitize(d.get("nome", "Candidato")), align="C", new_x="LMARGIN", new_y="NEXT")
         
         partes = [v for k, v in d.items() if k != "nome" and v and isinstance(v, str)]
         if partes:
             self.set_font("helvetica", "", 10)
-            self.multi_cell(0, 6, sanitize(" | ".join(partes)), align="C")
+            self.multi_cell(0, 6, sanitize(" | ".join(partes)), align="C", new_x="LMARGIN", new_y="NEXT")
         self.ln(4)
 
     def secao(self, titulo):
@@ -115,10 +116,10 @@ class CurriculoHarvard(FPDF):
     def item_experiencia(self, exp: dict):
         if not isinstance(exp, dict): return
         self.set_font("helvetica", "B", 11)
-        self.multi_cell(0, 6, sanitize(f"{exp.get('cargo','')} -- {exp.get('empresa','')}"))
+        self.multi_cell(0, 6, sanitize(f"{exp.get('cargo','')} -- {exp.get('empresa','')}"), new_x="LMARGIN", new_y="NEXT")
         
         self.set_font("helvetica", "I", 10)
-        self.multi_cell(0, 5, sanitize(exp.get("periodo", "")))
+        self.multi_cell(0, 5, sanitize(exp.get("periodo", "")), new_x="LMARGIN", new_y="NEXT")
         
         self.set_font("helvetica", "", 10)
         conquistas = exp.get("conquistas", [])
@@ -126,7 +127,7 @@ class CurriculoHarvard(FPDF):
         if isinstance(conquistas, str): conquistas = [conquistas]
         if isinstance(conquistas, list):
             for b in conquistas:
-                if b: self.multi_cell(0, 5, sanitize(f"- {b}"))
+                if b: self.multi_cell(0, 5, sanitize(f"- {b}"), new_x="LMARGIN", new_y="NEXT")
         self.ln(2)
 
 def gerar_pdf(dados: dict) -> io.BytesIO:
@@ -137,7 +138,7 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
     if dados.get("resumo"):
         pdf.secao("Resumo Profissional")
         pdf.set_font("helvetica", "", 10)
-        pdf.multi_cell(0, 5, sanitize(dados["resumo"]))
+        pdf.multi_cell(0, 5, sanitize(dados["resumo"]), new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
 
     for titulo, chave in [("Experiencia", "experiencias"), ("Formacao", "educacao")]:
@@ -150,9 +151,9 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
                     pdf.item_experiencia(item)
                 else:
                     pdf.set_font("helvetica", "B", 11)
-                    pdf.multi_cell(0, 6, sanitize(item.get("curso", "")))
+                    pdf.multi_cell(0, 6, sanitize(item.get("curso", "")), new_x="LMARGIN", new_y="NEXT")
                     pdf.set_font("helvetica", "", 10)
-                    pdf.multi_cell(0, 5, sanitize(f"{item.get('instituicao','')} | {item.get('periodo','')}"))
+                    pdf.multi_cell(0, 5, sanitize(f"{item.get('instituicao','')} | {item.get('periodo','')}"), new_x="LMARGIN", new_y="NEXT")
                     pdf.ln(2)
 
     for tit, ch in [("Habilidades", "competencias"), ("Idiomas", "idiomas")]:
@@ -162,7 +163,7 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
             pdf.secao(tit)
             pdf.set_font("helvetica", "", 10)
             for i in lista: 
-                if i: pdf.multi_cell(0, 5, sanitize(f"- {i}"))
+                if i: pdf.multi_cell(0, 5, sanitize(f"- {i}"), new_x="LMARGIN", new_y="NEXT")
 
     buf = io.BytesIO()
     pdf.output(buf)
