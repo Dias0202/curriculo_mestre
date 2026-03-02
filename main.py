@@ -77,26 +77,37 @@ def safe_string(val) -> str:
 
 def extrair_texto_de_arquivo(file_bytes: bytearray, filename: str) -> str:
     ext = filename.lower()
+    texto_extraido = ""
+    
     if ext.endswith(".pdf"):
         try:
             from pypdf import PdfReader
             reader = PdfReader(io.BytesIO(file_bytes))
-            return "\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
+            paginas = []
+            for p in reader.pages:
+                # O modo layout preserva o espacamento horizontal de colunas no PDF
+                ext_txt = p.extract_text(extraction_mode="layout")
+                if ext_txt: paginas.append(ext_txt)
+            texto_extraido = "\n".join(paginas)
         except Exception as e:
             logger.error(f"Erro PDF: {e}")
-            return ""
     elif ext.endswith(".docx"):
         try:
             doc = docx.Document(io.BytesIO(file_bytes))
-            return "\n".join([p.text for p in doc.paragraphs])
+            texto_extraido = "\n".join([p.text for p in doc.paragraphs])
         except Exception as e:
             logger.error(f"Erro DOCX: {e}")
-            return ""
     else:
         for enc in ["utf-8", "latin-1", "cp1252"]:
-            try: return file_bytes.decode(enc)
+            try: 
+                texto_extraido = file_bytes.decode(enc)
+                break
             except UnicodeDecodeError: continue
-        return file_bytes.decode("utf-8", errors="ignore")
+        if not texto_extraido:
+            texto_extraido = file_bytes.decode("utf-8", errors="ignore")
+
+    # Remove null bytes que invalidam a insercao no PostgreSQL
+    return texto_extraido.replace('\x00', ' ').strip()
 
 # =========================================================
 # OPERACOES DE BANCO DE DADOS RELACIONAL (SUPABASE)
@@ -107,7 +118,6 @@ def get_user_by_telegram(telegram_id: int):
 
 def save_user_base(telegram_id: int, dados: dict):
     dados["telegram_id"] = str(telegram_id)
-    # Busca se ja existe para nao recriar o UUID
     user = get_user_by_telegram(telegram_id)
     if user:
         db_client.table("users").update(dados).eq("id", user["id"]).execute()
@@ -115,12 +125,9 @@ def save_user_base(telegram_id: int, dados: dict):
         db_client.table("users").insert(dados).execute()
 
 def fetch_full_user_profile(user_uuid: str) -> str:
-    """Busca os dados de todas as tabelas e compila em uma string estruturada para o LLM."""
     if not user_uuid: return ""
-    
     profile = {}
     
-    # Experiences
     exp_res = db_client.table("experiences").select("*").eq("user_id", user_uuid).execute()
     experiences = exp_res.data or []
     for exp in experiences:
@@ -130,7 +137,6 @@ def fetch_full_user_profile(user_uuid: str) -> str:
         exp["conquistas"] = [b["texto"] for b in bullets if b["tipo"] == "conquista"]
     profile["experiences"] = experiences
 
-    # Education, Skills, Certs, Projects, Languages
     profile["education"] = db_client.table("education").select("*").eq("user_id", user_uuid).execute().data or []
     profile["skills"] = db_client.table("skills").select("*").eq("user_id", user_uuid).execute().data or []
     profile["certifications"] = db_client.table("certifications").select("*").eq("user_id", user_uuid).execute().data or []
@@ -140,11 +146,8 @@ def fetch_full_user_profile(user_uuid: str) -> str:
     return json.dumps(profile, ensure_ascii=False, indent=2)
 
 def save_parsed_history_to_db(user_uuid: str, parsed_json: dict):
-    """Limpa tabelas antigas do usuario e insere os dados consolidados pelo LLM."""
     if not user_uuid: return
 
-    # Deleta dados antigos em cascata. O Supabase On Delete Cascade resolve os bullets se a exp for deletada.
-    # Por prevencao e limpeza manual via API:
     db_client.table("experiences").delete().eq("user_id", user_uuid).execute()
     db_client.table("education").delete().eq("user_id", user_uuid).execute()
     db_client.table("skills").delete().eq("user_id", user_uuid).execute()
@@ -152,7 +155,6 @@ def save_parsed_history_to_db(user_uuid: str, parsed_json: dict):
     db_client.table("projects").delete().eq("user_id", user_uuid).execute()
     db_client.table("languages").delete().eq("user_id", user_uuid).execute()
 
-    # Insercao de Experiencias e Bullets
     for exp in parsed_json.get("experiences", []):
         exp_data = {
             "user_id": user_uuid,
@@ -174,36 +176,20 @@ def save_parsed_history_to_db(user_uuid: str, parsed_json: dict):
             if bullets:
                 db_client.table("experience_bullets").insert(bullets).execute()
 
-    # Insercao de Education
-    edu_list = []
-    for ed in parsed_json.get("education", []):
-        edu_list.append({"user_id": user_uuid, "grau": ed.get("grau"), "instituicao": ed.get("instituicao"), "ano_inicio": ed.get("ano_inicio"), "ano_fim": ed.get("ano_fim")})
+    edu_list = [{"user_id": user_uuid, "grau": ed.get("grau"), "instituicao": ed.get("instituicao"), "ano_inicio": ed.get("ano_inicio"), "ano_fim": ed.get("ano_fim")} for ed in parsed_json.get("education", [])]
     if edu_list: db_client.table("education").insert(edu_list).execute()
 
-    # Insercao de Skills
-    skill_list = []
-    for sk in parsed_json.get("skills", []):
-        skill_list.append({"user_id": user_uuid, "nome": sk.get("nome"), "categoria": sk.get("categoria"), "nivel": sk.get("nivel")})
+    skill_list = [{"user_id": user_uuid, "nome": sk.get("nome"), "categoria": sk.get("categoria"), "nivel": sk.get("nivel")} for sk in parsed_json.get("skills", [])]
     if skill_list: db_client.table("skills").insert(skill_list).execute()
 
-    # Insercao de Certifications
-    cert_list = []
-    for cert in parsed_json.get("certifications", []):
-        cert_list.append({"user_id": user_uuid, "nome": cert.get("nome"), "emissor": cert.get("emissor"), "ano": cert.get("ano")})
+    cert_list = [{"user_id": user_uuid, "nome": cert.get("nome"), "emissor": cert.get("emissor"), "ano": cert.get("ano")} for cert in parsed_json.get("certifications", [])]
     if cert_list: db_client.table("certifications").insert(cert_list).execute()
 
-    # Insercao de Projects
-    proj_list = []
-    for proj in parsed_json.get("projects", []):
-        proj_list.append({"user_id": user_uuid, "nome": proj.get("nome"), "descricao": proj.get("descricao")})
+    proj_list = [{"user_id": user_uuid, "nome": proj.get("nome"), "descricao": proj.get("descricao")} for proj in parsed_json.get("projects", [])]
     if proj_list: db_client.table("projects").insert(proj_list).execute()
 
-    # Insercao de Languages
-    lang_list = []
-    for lang in parsed_json.get("languages", []):
-        lang_list.append({"user_id": user_uuid, "idioma": lang.get("idioma"), "nivel": lang.get("nivel")})
+    lang_list = [{"user_id": user_uuid, "idioma": lang.get("idioma"), "nivel": lang.get("nivel")} for lang in parsed_json.get("languages", [])]
     if lang_list: db_client.table("languages").insert(lang_list).execute()
-
 
 # =========================================================
 # GERADOR DE PDF
@@ -377,10 +363,10 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
 # =========================================================
 def classificar_intencao_e_idioma_llm(texto) -> dict:
     p = (
-        "Responda APENAS com um JSON valido contendo as chaves 'intencao' e 'idioma'.\n"
+        "Analise o texto fornecido e classifique a intencao do usuario. Responda APENAS com um JSON valido contendo as chaves 'intencao' e 'idioma'.\n"
         "Regras:\n"
-        "1. 'intencao': 'VAGA' se for descricao de emprego, ou 'HISTORICO' se o texto for um curriculo base, curso, certificacao ou atualizacao profissional.\n"
-        "2. 'idioma': Idioma original do texto ou o idioma solicitado explicitamente.\n\n"
+        "1. 'intencao': Retorne 'VAGA' se o texto for uma descricao de emprego. Retorne 'HISTORICO' se o texto contiver dados profissionais, curriculo, cursos ou atualizacoes reais. Retorne 'IRRELEVANTE' se for apenas uma saudacao (ex: 'oi', 'tudo bem'), conversa fiada ou texto sem contexto util.\n"
+        "2. 'idioma': Idioma original do texto ou idioma explicitamente exigido.\n\n"
         f"TEXTO:\n{texto[:1500]}"
     )
     try:
@@ -412,7 +398,6 @@ def gerar_curriculo_json(hist, vaga, perfil, idioma_detectado):
         logger.error("Erro ao carregar prompt_generator.md.")
         raise e
 
-    # Aplicacao da funcao safe_string para evitar colapso de tipagem com SQL NULL
     prompt_final = template.replace("{idioma_detectado}", safe_string(idioma_detectado))\
                            .replace("{nome}", safe_string(perfil.get("nome")))\
                            .replace("{telefone}", safe_string(perfil.get("telefone")))\
@@ -435,28 +420,35 @@ def gerar_curriculo_json(hist, vaga, perfil, idioma_detectado):
     texto_json = re.sub(r'```$', '', texto_json).strip()
     
     return json.loads(texto_json)
+
 # =========================================================
 # HANDLERS DO TELEGRAM
 # =========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = get_user_by_telegram(update.effective_user.id)
+    user_id = update.effective_user.id
+    nome_usuario = update.effective_user.first_name or "Profissional"
+    
+    u = get_user_by_telegram(user_id)
     if u and u.get("email"):
-        await update.message.reply_text("Bem-vindo de volta! Seu perfil basico ja esta configurado.\n\n"
-                                        "1. Envie ou cole seu Historico Profissional para atualizar o banco de dados.\n"
-                                        "2. Cole a Descricao da Vaga para gerar o PDF direcionado.\n")
+        await update.message.reply_text(
+            f"Bem-vindo de volta, {nome_usuario}. O seu perfil base encontra-se ativo no banco de dados.\n\n"
+            "Instrucoes operacionais:\n"
+            "1. Envie ou cole seu Historico Profissional para atualizar o sistema.\n"
+            "2. Cole a Descricao da Vaga para gerar o documento formatado."
+        )
         return ConversationHandler.END
     
-    await update.message.reply_text("Bem-vindo ao Gerador de Curriculos ATS.\n\nQual o seu E-MAIL profissional?")
+    await update.message.reply_text(f"Ola, {nome_usuario}. Iniciando o assistente de otimizacao ATS.\n\nPor favor, informe o seu E-MAIL corporativo ou profissional.")
     return ASK_EMAIL
 
 async def ask_email(u, c): 
     c.user_data['e'] = u.message.text
-    await u.message.reply_text("Qual o seu numero de TELEFONE (com DDD)?")
+    await u.message.reply_text("Informacao registrada. Qual e o seu numero de TELEFONE (com DDD)?")
     return ASK_PHONE
 
 async def ask_phone(u, c): 
     c.user_data['t'] = u.message.text
-    await u.message.reply_text("Envie o link ou usuario do seu LINKEDIN.")
+    await u.message.reply_text("Certo. Agora, envie a URL ou o nome de usuario correspondente ao seu perfil no LINKEDIN.")
     return ASK_LINKEDIN
 
 async def ask_linkedin(u, c):
@@ -467,19 +459,20 @@ async def ask_linkedin(u, c):
         "telefone": c.user_data['t'], 
         "linkedin": u.message.text
     })
-    await u.message.reply_text("Perfil salvo! Envie seu historico (.pdf, .docx, .txt ou texto livre) para criar seu banco de dados, e depois envie uma vaga.")
+    await u.message.reply_text("Perfil base estruturado. Voce ja pode submeter o seu historico profissional nos formatos .pdf, .docx, .txt ou em texto simples.")
     return ConversationHandler.END
 
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_telegram = update.effective_user.id
+    nome_usuario = update.effective_user.first_name or "Profissional"
+    
     usuario = get_user_by_telegram(user_id_telegram)
     if not usuario or not usuario.get("email"):
-        await update.message.reply_text("Use o comando /start para iniciar.")
+        await update.message.reply_text("Cadastro base ausente. Execute o comando /start para configurar a sua conta.")
         return
 
-    status = await update.message.reply_text("Analisando dados e consultando banco de dados...")
+    status = await update.message.reply_text("Aguarde. Inicializando processos de analise e validacao...")
     
-    # Salva entrada bruta
     if update.message.document:
         f = await context.bot.get_file(update.message.document.file_id)
         b = bytearray(); await f.download_as_bytearray(out=b)
@@ -489,11 +482,9 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         texto = update.message.text
         tipo_raw = 'texto'
 
-    if not texto.strip():
-        await status.edit_text("Nenhum texto compativel detectado no envio.")
+    if not texto or not texto.strip():
+        await status.edit_text("Nenhum dado legivel identificado no arquivo ou mensagem enviada.")
         return
-
-    db_client.table("raw_inputs").insert({"user_id": usuario["id"], "tipo": tipo_raw[:50], "conteudo_texto": texto}).execute()
 
     from google.genai import errors as genai_errors
 
@@ -502,44 +493,51 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         intencao = classificacao.get("intencao", "VAGA")
         idioma_detectado = classificacao.get("idioma", "Ingles")
         
+        # Interceptacao de mensagens informais
+        if intencao == "IRRELEVANTE":
+            await status.edit_text(f"Ola, {nome_usuario}. Este canal destina-se a operacoes estruturadas. Submeta um historico profissional ou os requisitos de uma vaga para prosseguirmos.")
+            return
+
+        # O log de dados brutos e alimentado apenas apos a confirmacao de conteudo util
+        db_client.table("raw_inputs").insert({"user_id": usuario["id"], "tipo": tipo_raw[:50], "conteudo_texto": texto}).execute()
+        
         perfil_atual_str = fetch_full_user_profile(usuario["id"])
 
         if intencao == "HISTORICO":
-            await status.edit_text("Atualizando tabelas relacionais do seu perfil profissional...")
+            await status.edit_text("Entrada classificada como Historico. Atualizando as tabelas relacionais do seu perfil...")
             
             parsed_json = extrair_e_mesclar_historico(perfil_atual_str, texto)
             save_parsed_history_to_db(usuario["id"], parsed_json)
             
-            await status.edit_text("Banco de dados atualizado com sucesso! Agora voce pode enviar a descricao da vaga.")
+            await status.edit_text("Concluido. O banco de dados foi integrado e consolidado. O sistema esta pronto para receber a analise de uma vaga.")
         else:
             if not perfil_atual_str or len(perfil_atual_str) < 50:
-                await status.edit_text("Envie seu historico profissional antes de mandar a vaga."); return
+                await status.edit_text("Base de dados insuficiente. Carregue o seu historico profissional antes de prosseguir com a vaga."); return
             
-            await status.edit_text(f"Vaga detectada. Adequando curriculo para o idioma {idioma_detectado}...")
+            await status.edit_text(f"Entrada classificada como Vaga. Gerando output formatado e traduzido para o idioma: {idioma_detectado}.")
             dados = gerar_curriculo_json(perfil_atual_str, texto, usuario, idioma_detectado)
             
-            # Salva o historico de geracao
             db_client.table("generated_resumes").insert({"user_id": usuario["id"], "vaga_texto": texto, "idioma": idioma_detectado, "json_gerado": dados}).execute()
 
             pdf = gerar_pdf(dados)
-            nome = safe_string(dados.get("identificacao", {}).get("nome", "Candidato")).replace(" ", "_")
-            await update.message.reply_document(document=pdf, filename=f"CV_{nome}_ATS.pdf")
+            nome_arquivo = safe_string(dados.get("identificacao", {}).get("nome", "Candidato")).replace(" ", "_")
+            await update.message.reply_document(document=pdf, filename=f"CV_{nome_arquivo}_ATS.pdf")
             await status.delete()
 
     except genai_errors.ClientError as e:
         if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-            await status.edit_text("Servidor da IA sobrecarregado. Aguarde 1 minuto e tente novamente.")
+            await status.edit_text("O limite de cota da API foi atingido. Aguarde um instante e repita a operacao.")
         else:
             logger.error(f"Erro da API: {e}")
-            await status.edit_text("Ocorreu um erro ao comunicar com a IA.")
+            await status.edit_text("Falha de comunicacao com o modulo de Inteligencia Artificial.")
             
     except json.JSONDecodeError as e:
         logger.error(f"Erro JSON: {e}")
-        await status.edit_text("Falha estrutural de JSON no modelo. Tente novamente.")
+        await status.edit_text("Ocorreu uma falha estrutural ao formatar o JSON de saida. Envie os dados novamente.")
         
     except Exception as e:
         logger.error(f"Erro: {e}", exc_info=True)
-        await status.edit_text("Erro interno ao processar os dados ou gerar o PDF.")
+        await status.edit_text("Ocorreu um erro interno imprevisto durante o processamento do PDF ou insercao no banco.")
 
 def main():
     threading.Thread(target=start_health_server, daemon=True).start()
