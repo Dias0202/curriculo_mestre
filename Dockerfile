@@ -17,9 +17,8 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia o código
-COPY main.py .
-
+# Copia todos os arquivos do projeto
+COPY . .
 # Porta que o Render vai expor para health check
 EXPOSE 10000
 
