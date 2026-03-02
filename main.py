@@ -22,6 +22,9 @@ from fpdf import FPDF
 from supabase import create_client, Client
 import docx
 
+# Importação do módulo de extração (deve estar no mesmo diretório)
+from scraper_vagas import extrair_vaga_linkedin_prod
+
 # =========================================================
 # CONFIGURACAO DE ESTADOS E LOGGING
 # =========================================================
@@ -432,7 +435,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Ola, {nome_usuario}. O seu perfil encontra-se ativo no banco de dados.\n\n"
             "Instrucoes operacionais:\n"
             "1. Envie seu Historico Profissional para atualizar o sistema.\n"
-            "2. Envie a Descricao da Vaga para gerar o documento formatado e obter o relatorio analitico.\n"
+            "2. Envie a Descricao ou o LINK da Vaga do LinkedIn para gerar o documento formatado.\n"
             "3. Utilize o comando /deletar caso deseje remover seus dados de nossos servidores."
         )
         return ConversationHandler.END
@@ -493,6 +496,32 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not texto or not texto.strip():
         await status.edit_text("Nenhum dado legivel identificado na entrada.")
         return
+
+    # ----------------------------------------------------------------------
+    # INTEGRACAO DO SCRAPER DO LINKEDIN
+    # ----------------------------------------------------------------------
+    padrao_linkedin = r'https://(?:www\.)?linkedin\.com/jobs/view/[0-9]+'
+    match_url = re.search(padrao_linkedin, texto)
+    
+    if match_url:
+        await status.edit_text("URL do LinkedIn detectada. Iniciando extracao remota de dados via Guest API...")
+        url_encontrada = match_url.group(0)
+        resultado_scraper = extrair_vaga_linkedin_prod(url_encontrada)
+        
+        if resultado_scraper.get("sucesso"):
+            vaga_dados = resultado_scraper["dados"]
+            # Substitui a URL pela string estruturada da vaga para analise do LLM
+            texto = f"Titulo da Vaga: {vaga_dados['titulo']}\nEmpresa: {vaga_dados['empresa']}\nLocalizacao: {vaga_dados['localizacao']}\n\nDescricao:\n{vaga_dados['descricao']}"
+            await status.edit_text("Extracao concluida. Direcionando dados para classificacao semantica do modelo de linguagem...")
+        else:
+            erro_scraper = resultado_scraper.get("erro", "Falha de comunicacao com o host.")
+            await status.edit_text(
+                f"Nao foi possivel extrair os dados automaticamente devido a bloqueios temporarios da plataforma do LinkedIn.\n"
+                f"Erro tecnico retornado: {erro_scraper}\n\n"
+                f"Por favor, copie e cole o texto completo da vaga manualmente."
+            )
+            return
+    # ----------------------------------------------------------------------
 
     from google.genai import errors as genai_errors
 
