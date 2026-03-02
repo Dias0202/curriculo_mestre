@@ -474,8 +474,9 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("Aguarde. Inicializando processos de analise e validacao...")
     
     if update.message.document:
+        if update.message.document:
         f = await context.bot.get_file(update.message.document.file_id)
-        b = bytearray(); await f.download_as_bytearray(out=b)
+        b = await f.download_as_bytearray()
         texto = extrair_texto_de_arquivo(b, update.message.document.file_name)
         tipo_raw = update.message.document.file_name.split('.')[-1].lower() if '.' in update.message.document.file_name else 'arquivo'
     else:
