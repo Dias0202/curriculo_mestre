@@ -1,3 +1,4 @@
+Adicionar o cache persistente
 🧱 1️⃣ TABELA: users
 📌 Nome no projeto:
 
