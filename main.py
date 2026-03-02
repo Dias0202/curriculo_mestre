@@ -412,20 +412,29 @@ def gerar_curriculo_json(hist, vaga, perfil, idioma_detectado):
         logger.error("Erro ao carregar prompt_generator.md.")
         raise e
 
-    prompt_final = template.replace("{idioma_detectado}", idioma_detectado)\
-                           .replace("{nome}", perfil.get("nome", ""))\
-                           .replace("{telefone}", perfil.get("telefone", ""))\
-                           .replace("{email}", perfil.get("email", ""))\
-                           .replace("{linkedin}", perfil.get("linkedin", ""))\
-                           .replace("{github}", perfil.get("github", ""))\
-                           .replace("{portfolio}", perfil.get("portfolio", ""))\
-                           .replace("{historico}", hist)\
-                           .replace("{vaga}", vaga)
+    # Aplicacao da funcao safe_string para evitar colapso de tipagem com SQL NULL
+    prompt_final = template.replace("{idioma_detectado}", safe_string(idioma_detectado))\
+                           .replace("{nome}", safe_string(perfil.get("nome")))\
+                           .replace("{telefone}", safe_string(perfil.get("telefone")))\
+                           .replace("{email}", safe_string(perfil.get("email")))\
+                           .replace("{linkedin}", safe_string(perfil.get("linkedin")))\
+                           .replace("{github}", safe_string(perfil.get("github")))\
+                           .replace("{portfolio}", safe_string(perfil.get("portfolio")))\
+                           .replace("{historico}", safe_string(hist))\
+                           .replace("{vaga}", safe_string(vaga))
     
-    resp = llm_client.models.generate_content(model="gemma-3-27b-it", contents=prompt_final, config=genai.types.GenerateContentConfig(temperature=0.1))
-    texto_json = re.sub(r'^```json|```$', '', resp.text.strip(), flags=re.IGNORECASE).strip()
+    resp = llm_client.models.generate_content(
+        model="gemma-3-27b-it", 
+        contents=prompt_final, 
+        config=genai.types.GenerateContentConfig(temperature=0.1)
+    )
+    
+    texto_json = resp.text.strip()
+    texto_json = re.sub(r'^```json', '', texto_json, flags=re.IGNORECASE)
+    texto_json = re.sub(r'^```', '', texto_json)
+    texto_json = re.sub(r'```$', '', texto_json).strip()
+    
     return json.loads(texto_json)
-
 # =========================================================
 # HANDLERS DO TELEGRAM
 # =========================================================
