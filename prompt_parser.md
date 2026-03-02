@@ -23,10 +23,11 @@ SCHEMA EXIGIDO:
   ],
   "education": [
     {
-      "grau": "string",
+      "grau": "Bacharelado, Mestrado, etc.",
+      "curso": "Nome exato da área de formação (ex: Microbiologia)",
       "instituicao": "string",
-      "ano_inicio": "string",
-      "ano_fim": "string"
+      "ano_inicio": "string ou nulo se não informado",
+      "ano_fim": "string ou nulo se não informado"
     }
   ],
   "skills": [
