@@ -85,7 +85,6 @@ def extrair_texto_de_arquivo(file_bytes: bytearray, filename: str) -> str:
             reader = PdfReader(io.BytesIO(file_bytes))
             paginas = []
             for p in reader.pages:
-                # O modo layout preserva o espacamento horizontal de colunas no PDF
                 ext_txt = p.extract_text(extraction_mode="layout")
                 if ext_txt: paginas.append(ext_txt)
             texto_extraido = "\n".join(paginas)
@@ -106,7 +105,6 @@ def extrair_texto_de_arquivo(file_bytes: bytearray, filename: str) -> str:
         if not texto_extraido:
             texto_extraido = file_bytes.decode("utf-8", errors="ignore")
 
-    # Remove null bytes que invalidam a insercao no PostgreSQL
     return texto_extraido.replace('\x00', ' ').strip()
 
 # =========================================================
@@ -365,7 +363,7 @@ def classificar_intencao_e_idioma_llm(texto) -> dict:
     p = (
         "Analise o texto fornecido e classifique a intencao do usuario. Responda APENAS com um JSON valido contendo as chaves 'intencao' e 'idioma'.\n"
         "Regras:\n"
-        "1. 'intencao': Retorne 'VAGA' se o texto for uma descricao de emprego. Retorne 'HISTORICO' se o texto contiver dados profissionais, curriculo, cursos ou atualizacoes reais. Retorne 'IRRELEVANTE' se for apenas uma saudacao (ex: 'oi', 'tudo bem'), conversa fiada ou texto sem contexto util.\n"
+        "1. 'intencao': Retorne 'VAGA' se o texto for uma descricao de emprego. Retorne 'HISTORICO' se o texto contiver dados profissionais reais. Retorne 'IRRELEVANTE' se for apenas uma saudacao, mensagem fora de contexto profissional ou conversa fiada.\n"
         "2. 'idioma': Idioma original do texto ou idioma explicitamente exigido.\n\n"
         f"TEXTO:\n{texto[:1500]}"
     )
@@ -431,10 +429,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = get_user_by_telegram(user_id)
     if u and u.get("email"):
         await update.message.reply_text(
-            f"Bem-vindo de volta, {nome_usuario}. O seu perfil base encontra-se ativo no banco de dados.\n\n"
+            f"Ola, {nome_usuario}. O seu perfil encontra-se ativo no banco de dados.\n\n"
             "Instrucoes operacionais:\n"
-            "1. Envie ou cole seu Historico Profissional para atualizar o sistema.\n"
-            "2. Cole a Descricao da Vaga para gerar o documento formatado."
+            "1. Envie seu Historico Profissional para atualizar o sistema.\n"
+            "2. Envie a Descricao da Vaga para gerar o documento formatado e obter o relatorio analitico.\n"
+            "3. Utilize o comando /deletar caso deseje remover seus dados de nossos servidores."
         )
         return ConversationHandler.END
     
@@ -462,6 +461,15 @@ async def ask_linkedin(u, c):
     await u.message.reply_text("Perfil base estruturado. Voce ja pode submeter o seu historico profissional nos formatos .pdf, .docx, .txt ou em texto simples.")
     return ConversationHandler.END
 
+async def cmd_deletar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    u = get_user_by_telegram(user_id)
+    if u:
+        db_client.table("users").delete().eq("id", u["id"]).execute()
+        await update.message.reply_text("Processo concluido. Todos os seus dados foram permanentemente excluidos da base de dados.")
+    else:
+        await update.message.reply_text("Nenhum registro correspondente foi localizado no sistema.")
+
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_telegram = update.effective_user.id
     nome_usuario = update.effective_user.first_name or "Profissional"
@@ -474,7 +482,6 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("Aguarde. Inicializando processos de analise e validacao...")
     
     if update.message.document:
-        if update.message.document:
         f = await context.bot.get_file(update.message.document.file_id)
         b = await f.download_as_bytearray()
         texto = extrair_texto_de_arquivo(b, update.message.document.file_name)
@@ -484,7 +491,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tipo_raw = 'texto'
 
     if not texto or not texto.strip():
-        await status.edit_text("Nenhum dado legivel identificado no arquivo ou mensagem enviada.")
+        await status.edit_text("Nenhum dado legivel identificado na entrada.")
         return
 
     from google.genai import errors as genai_errors
@@ -494,35 +501,54 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         intencao = classificacao.get("intencao", "VAGA")
         idioma_detectado = classificacao.get("idioma", "Ingles")
         
-        # Interceptacao de mensagens informais
         if intencao == "IRRELEVANTE":
-            await status.edit_text(f"Ola, {nome_usuario}. Este canal destina-se a operacoes estruturadas. Submeta um historico profissional ou os requisitos de uma vaga para prosseguirmos.")
+            await status.edit_text(f"Ola, {nome_usuario}. O sistema atua com o processamento de dados profissionais ou requisitos de vagas. Forneca uma entrada estruturada para prosseguirmos.")
             return
 
-        # O log de dados brutos e alimentado apenas apos a confirmacao de conteudo util
         db_client.table("raw_inputs").insert({"user_id": usuario["id"], "tipo": tipo_raw[:50], "conteudo_texto": texto}).execute()
         
         perfil_atual_str = fetch_full_user_profile(usuario["id"])
 
         if intencao == "HISTORICO":
-            await status.edit_text("Entrada classificada como Historico. Atualizando as tabelas relacionais do seu perfil...")
+            await status.edit_text("Atualizando as tabelas relacionais do seu perfil com os novos dados...")
             
             parsed_json = extrair_e_mesclar_historico(perfil_atual_str, texto)
             save_parsed_history_to_db(usuario["id"], parsed_json)
             
-            await status.edit_text("Concluido. O banco de dados foi integrado e consolidado. O sistema esta pronto para receber a analise de uma vaga.")
+            await status.edit_text("Concluido. O banco de dados foi integrado. O sistema esta pronto para processar os requisitos de uma vaga.")
         else:
             if not perfil_atual_str or len(perfil_atual_str) < 50:
-                await status.edit_text("Base de dados insuficiente. Carregue o seu historico profissional antes de prosseguir com a vaga."); return
+                await status.edit_text("Base de dados insuficiente. Carregue o seu historico profissional antes de prosseguir."); return
             
-            await status.edit_text(f"Entrada classificada como Vaga. Gerando output formatado e traduzido para o idioma: {idioma_detectado}.")
+            await status.edit_text(f"Iniciando a geracao e traducao do documento ATS para: {idioma_detectado}.")
             dados = gerar_curriculo_json(perfil_atual_str, texto, usuario, idioma_detectado)
             
-            db_client.table("generated_resumes").insert({"user_id": usuario["id"], "vaga_texto": texto, "idioma": idioma_detectado, "json_gerado": dados}).execute()
+            # Remocao da chave extra para n quebrar o construtor JSON do Supabase
+            json_para_banco = {k: v for k, v in dados.items() if k != "relatorio_analitico"}
+            db_client.table("generated_resumes").insert({
+                "user_id": usuario["id"], 
+                "vaga_texto": texto, 
+                "idioma": idioma_detectado, 
+                "json_gerado": json_para_banco,
+                "score_match": dados.get("relatorio_analitico", {}).get("match_score")
+            }).execute()
 
             pdf = gerar_pdf(dados)
             nome_arquivo = safe_string(dados.get("identificacao", {}).get("nome", "Candidato")).replace(" ", "_")
-            await update.message.reply_document(document=pdf, filename=f"CV_{nome_arquivo}_ATS.pdf")
+            
+            relatorio = dados.get("relatorio_analitico", {})
+            match_score = safe_string(relatorio.get("match_score", "N/A"))
+            gaps = ", ".join(relatorio.get("analise_gaps", []))
+            dica = safe_string(relatorio.get("dica_entrevista", "N/A"))
+            
+            resumo_executivo = (
+                f"Documento gerado com exito.\n\n"
+                f"Taxa de Compatibilidade (Match): {match_score}%\n"
+                f"Lacunas Identificadas (Gaps): {gaps}\n\n"
+                f"Preparacao Estrategica para a Entrevista:\n{dica}"
+            )
+            
+            await update.message.reply_document(document=pdf, filename=f"CV_{nome_arquivo}_ATS.pdf", caption=resumo_executivo)
             await status.delete()
 
     except genai_errors.ClientError as e:
@@ -534,11 +560,11 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     except json.JSONDecodeError as e:
         logger.error(f"Erro JSON: {e}")
-        await status.edit_text("Ocorreu uma falha estrutural ao formatar o JSON de saida. Envie os dados novamente.")
+        await status.edit_text("Ocorreu uma falha estrutural ao formatar a saida. Envie os dados novamente.")
         
     except Exception as e:
         logger.error(f"Erro: {e}", exc_info=True)
-        await status.edit_text("Ocorreu um erro interno imprevisto durante o processamento do PDF ou insercao no banco.")
+        await status.edit_text("Ocorreu um erro interno imprevisto durante o processamento da requisicao.")
 
 def main():
     threading.Thread(target=start_health_server, daemon=True).start()
@@ -555,6 +581,7 @@ def main():
     )
 
     app.add_handler(conv)
+    app.add_handler(CommandHandler("deletar", cmd_deletar))
     app.add_handler(MessageHandler(filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), handle_input))
     app.run_polling(drop_pending_updates=True)
 
