@@ -20,6 +20,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 from fpdf import FPDF
 from supabase import create_client, Client
+import docx
 
 # =========================================================
 # CONFIGURACAO DE ESTADOS E LOGGING
@@ -58,7 +59,7 @@ def start_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # =========================================================
-# UTILITARIOS CORE
+# UTILITARIOS E EXTRACAO
 # =========================================================
 _SUBS = {"\u2022": "-", "\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u00b7": "-", "\u2026": "..."}
 
@@ -75,7 +76,8 @@ def safe_string(val) -> str:
     return str(val).strip()
 
 def extrair_texto_de_arquivo(file_bytes: bytearray, filename: str) -> str:
-    if filename.lower().endswith(".pdf"):
+    ext = filename.lower()
+    if ext.endswith(".pdf"):
         try:
             from pypdf import PdfReader
             reader = PdfReader(io.BytesIO(file_bytes))
@@ -83,13 +85,128 @@ def extrair_texto_de_arquivo(file_bytes: bytearray, filename: str) -> str:
         except Exception as e:
             logger.error(f"Erro PDF: {e}")
             return ""
-    for enc in ["utf-8", "latin-1", "cp1252"]:
-        try: return file_bytes.decode(enc)
-        except UnicodeDecodeError: continue
-    return file_bytes.decode("utf-8", errors="ignore")
+    elif ext.endswith(".docx"):
+        try:
+            doc = docx.Document(io.BytesIO(file_bytes))
+            return "\n".join([p.text for p in doc.paragraphs])
+        except Exception as e:
+            logger.error(f"Erro DOCX: {e}")
+            return ""
+    else:
+        for enc in ["utf-8", "latin-1", "cp1252"]:
+            try: return file_bytes.decode(enc)
+            except UnicodeDecodeError: continue
+        return file_bytes.decode("utf-8", errors="ignore")
 
 # =========================================================
-# GERADOR DE PDF - FORMATO HARVARD
+# OPERACOES DE BANCO DE DADOS RELACIONAL (SUPABASE)
+# =========================================================
+def get_user_by_telegram(telegram_id: int):
+    r = db_client.table("users").select("*").eq("telegram_id", str(telegram_id)).execute()
+    return r.data[0] if r.data else None
+
+def save_user_base(telegram_id: int, dados: dict):
+    dados["telegram_id"] = str(telegram_id)
+    # Busca se ja existe para nao recriar o UUID
+    user = get_user_by_telegram(telegram_id)
+    if user:
+        db_client.table("users").update(dados).eq("id", user["id"]).execute()
+    else:
+        db_client.table("users").insert(dados).execute()
+
+def fetch_full_user_profile(user_uuid: str) -> str:
+    """Busca os dados de todas as tabelas e compila em uma string estruturada para o LLM."""
+    if not user_uuid: return ""
+    
+    profile = {}
+    
+    # Experiences
+    exp_res = db_client.table("experiences").select("*").eq("user_id", user_uuid).execute()
+    experiences = exp_res.data or []
+    for exp in experiences:
+        bull_res = db_client.table("experience_bullets").select("*").eq("experience_id", exp["id"]).execute()
+        bullets = bull_res.data or []
+        exp["responsabilidades"] = [b["texto"] for b in bullets if b["tipo"] == "responsabilidade"]
+        exp["conquistas"] = [b["texto"] for b in bullets if b["tipo"] == "conquista"]
+    profile["experiences"] = experiences
+
+    # Education, Skills, Certs, Projects, Languages
+    profile["education"] = db_client.table("education").select("*").eq("user_id", user_uuid).execute().data or []
+    profile["skills"] = db_client.table("skills").select("*").eq("user_id", user_uuid).execute().data or []
+    profile["certifications"] = db_client.table("certifications").select("*").eq("user_id", user_uuid).execute().data or []
+    profile["projects"] = db_client.table("projects").select("*").eq("user_id", user_uuid).execute().data or []
+    profile["languages"] = db_client.table("languages").select("*").eq("user_id", user_uuid).execute().data or []
+    
+    return json.dumps(profile, ensure_ascii=False, indent=2)
+
+def save_parsed_history_to_db(user_uuid: str, parsed_json: dict):
+    """Limpa tabelas antigas do usuario e insere os dados consolidados pelo LLM."""
+    if not user_uuid: return
+
+    # Deleta dados antigos em cascata. O Supabase On Delete Cascade resolve os bullets se a exp for deletada.
+    # Por prevencao e limpeza manual via API:
+    db_client.table("experiences").delete().eq("user_id", user_uuid).execute()
+    db_client.table("education").delete().eq("user_id", user_uuid).execute()
+    db_client.table("skills").delete().eq("user_id", user_uuid).execute()
+    db_client.table("certifications").delete().eq("user_id", user_uuid).execute()
+    db_client.table("projects").delete().eq("user_id", user_uuid).execute()
+    db_client.table("languages").delete().eq("user_id", user_uuid).execute()
+
+    # Insercao de Experiencias e Bullets
+    for exp in parsed_json.get("experiences", []):
+        exp_data = {
+            "user_id": user_uuid,
+            "cargo": exp.get("cargo"),
+            "empresa": exp.get("empresa"),
+            "localizacao": exp.get("localizacao"),
+            "data_inicio": exp.get("data_inicio"),
+            "data_fim": exp.get("data_fim"),
+            "descricao_empresa": exp.get("descricao_empresa")
+        }
+        res = db_client.table("experiences").insert(exp_data).execute()
+        if res.data:
+            exp_id = res.data[0]["id"]
+            bullets = []
+            for r in exp.get("responsabilidades", []):
+                if r: bullets.append({"experience_id": exp_id, "tipo": "responsabilidade", "texto": r})
+            for c in exp.get("conquistas", []):
+                if c: bullets.append({"experience_id": exp_id, "tipo": "conquista", "texto": c})
+            if bullets:
+                db_client.table("experience_bullets").insert(bullets).execute()
+
+    # Insercao de Education
+    edu_list = []
+    for ed in parsed_json.get("education", []):
+        edu_list.append({"user_id": user_uuid, "grau": ed.get("grau"), "instituicao": ed.get("instituicao"), "ano_inicio": ed.get("ano_inicio"), "ano_fim": ed.get("ano_fim")})
+    if edu_list: db_client.table("education").insert(edu_list).execute()
+
+    # Insercao de Skills
+    skill_list = []
+    for sk in parsed_json.get("skills", []):
+        skill_list.append({"user_id": user_uuid, "nome": sk.get("nome"), "categoria": sk.get("categoria"), "nivel": sk.get("nivel")})
+    if skill_list: db_client.table("skills").insert(skill_list).execute()
+
+    # Insercao de Certifications
+    cert_list = []
+    for cert in parsed_json.get("certifications", []):
+        cert_list.append({"user_id": user_uuid, "nome": cert.get("nome"), "emissor": cert.get("emissor"), "ano": cert.get("ano")})
+    if cert_list: db_client.table("certifications").insert(cert_list).execute()
+
+    # Insercao de Projects
+    proj_list = []
+    for proj in parsed_json.get("projects", []):
+        proj_list.append({"user_id": user_uuid, "nome": proj.get("nome"), "descricao": proj.get("descricao")})
+    if proj_list: db_client.table("projects").insert(proj_list).execute()
+
+    # Insercao de Languages
+    lang_list = []
+    for lang in parsed_json.get("languages", []):
+        lang_list.append({"user_id": user_uuid, "idioma": lang.get("idioma"), "nivel": lang.get("nivel")})
+    if lang_list: db_client.table("languages").insert(lang_list).execute()
+
+
+# =========================================================
+# GERADOR DE PDF
 # =========================================================
 class CurriculoHarvard(FPDF):
     def __init__(self):
@@ -99,17 +216,14 @@ class CurriculoHarvard(FPDF):
         self.set_auto_page_break(True, margin=15)
 
     def cabecalho_candidato(self, d: dict):
-        # Nome
         self.set_font("helvetica", "B", 18)
         self.multi_cell(0, 8, sanitize(safe_string(d.get("nome", "Candidato")).upper()), align="C", new_x="LMARGIN", new_y="NEXT")
         
-        # Titulo Profissional
         titulo = safe_string(d.get("titulo", ""))
         if titulo:
             self.set_font("helvetica", "B", 12)
             self.multi_cell(0, 6, sanitize(titulo), align="C", new_x="LMARGIN", new_y="NEXT")
 
-        # Contatos
         partes = [safe_string(d.get(k)) for k in ["localizacao", "telefone", "email", "linkedin", "github", "portfolio"] if d.get(k)]
         if partes:
             self.set_font("helvetica", "", 10)
@@ -167,19 +281,16 @@ class CurriculoHarvard(FPDF):
         x_left = self.l_margin
         x_right = self.l_margin + col_w
 
-        # Filtra itens nulos ou vazios
         itens_limpos = [safe_string(i) for i in itens if safe_string(i)]
 
         for i in range(0, len(itens_limpos), 2):
             y_start = self.get_y()
             
-            # Item Esquerda
             item1 = sanitize(f"- {itens_limpos[i]}")
             self.set_xy(x_left, y_start)
             self.multi_cell(col_w - 5, 5, item1)
             y_end_1 = self.get_y()
             
-            # Item Direita
             y_end_2 = y_start
             if i + 1 < len(itens_limpos):
                 item2 = sanitize(f"- {itens_limpos[i+1]}")
@@ -187,7 +298,6 @@ class CurriculoHarvard(FPDF):
                 self.multi_cell(col_w - 5, 5, item2)
                 y_end_2 = self.get_y()
             
-            # Retorna o cursor Y para a base do maior item renderizado
             self.set_y(max(y_end_1, y_end_2))
             self.set_x(self.l_margin)
             
@@ -198,7 +308,6 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
     pdf = CurriculoHarvard()
     
     cabecalhos = dados.get("cabecalhos", {})
-    
     pdf.cabecalho_candidato(dados.get("identificacao", {}))
     
     if dados.get("resumo"):
@@ -264,13 +373,13 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
     return buf
 
 # =========================================================
-# LOGICA LLM 
+# LOGICA LLM E ROTEAMENTO
 # =========================================================
 def classificar_intencao_e_idioma_llm(texto) -> dict:
     p = (
         "Responda APENAS com um JSON valido contendo as chaves 'intencao' e 'idioma'.\n"
         "Regras:\n"
-        "1. 'intencao': 'VAGA' se for descricao de emprego, ou 'HISTORICO' se for curriculo base.\n"
+        "1. 'intencao': 'VAGA' se for descricao de emprego, ou 'HISTORICO' se o texto for um curriculo base, curso, certificacao ou atualizacao profissional.\n"
         "2. 'idioma': Idioma original do texto ou o idioma solicitado explicitamente.\n\n"
         f"TEXTO:\n{texto[:1500]}"
     )
@@ -281,62 +390,51 @@ def classificar_intencao_e_idioma_llm(texto) -> dict:
     except:
         return {"intencao": "VAGA", "idioma": "Ingles"}
 
-def consolidar_historico_llm(atual, novo):
-    p = f"Mescle as novas informacoes ao historico atual. Retorne apenas o texto consolidado:\n\nATUAL:\n{atual}\n\nNOVA:\n{novo}"
-    return llm_client.models.generate_content(model="gemma-3-27b-it", contents=p).text.strip()
+def extrair_e_mesclar_historico(perfil_atual_str, nova_entrada):
+    try:
+        with open("prompt_parser.md", "r", encoding="utf-8") as f:
+            template = f.read()
+    except Exception as e:
+        logger.error("Erro ao carregar prompt_parser.md.")
+        raise e
+        
+    prompt_final = template.replace("{perfil_atual}", perfil_atual_str).replace("{nova_entrada}", nova_entrada)
+    
+    resp = llm_client.models.generate_content(model="gemma-3-27b-it", contents=prompt_final, config=genai.types.GenerateContentConfig(temperature=0.1))
+    texto_json = re.sub(r'^```json|```$', '', resp.text.strip(), flags=re.IGNORECASE).strip()
+    return json.loads(texto_json)
 
 def gerar_curriculo_json(hist, vaga, perfil, idioma_detectado):
     try:
-        with open("prompt.md", "r", encoding="utf-8") as f:
-            template_prompt = f.read()
+        with open("prompt_generator.md", "r", encoding="utf-8") as f:
+            template = f.read()
     except Exception as e:
-        logger.error("Erro ao carregar prompt.md. Certifique-se de que o arquivo existe.")
+        logger.error("Erro ao carregar prompt_generator.md.")
         raise e
 
-    # Substitui as variaveis no arquivo markdown
-    prompt_final = template_prompt.replace("{idioma_detectado}", idioma_detectado)\
-                                  .replace("{nome}", perfil.get("nome", ""))\
-                                  .replace("{telefone}", perfil.get("telefone", ""))\
-                                  .replace("{email}", perfil.get("email", ""))\
-                                  .replace("{linkedin}", perfil.get("linkedin", ""))\
-                                  .replace("{historico}", hist)\
-                                  .replace("{vaga}", vaga)
+    prompt_final = template.replace("{idioma_detectado}", idioma_detectado)\
+                           .replace("{nome}", perfil.get("nome", ""))\
+                           .replace("{telefone}", perfil.get("telefone", ""))\
+                           .replace("{email}", perfil.get("email", ""))\
+                           .replace("{linkedin}", perfil.get("linkedin", ""))\
+                           .replace("{github}", perfil.get("github", ""))\
+                           .replace("{portfolio}", perfil.get("portfolio", ""))\
+                           .replace("{historico}", hist)\
+                           .replace("{vaga}", vaga)
     
-    resp = llm_client.models.generate_content(
-        model="gemma-3-27b-it",
-        contents=prompt_final,
-        config=genai.types.GenerateContentConfig(temperature=0.1)
-    )
-    
-    texto_json = resp.text.strip()
-    texto_json = re.sub(r'^```json', '', texto_json, flags=re.IGNORECASE)
-    texto_json = re.sub(r'^```', '', texto_json)
-    texto_json = re.sub(r'```$', '', texto_json).strip()
-    
+    resp = llm_client.models.generate_content(model="gemma-3-27b-it", contents=prompt_final, config=genai.types.GenerateContentConfig(temperature=0.1))
+    texto_json = re.sub(r'^```json|```$', '', resp.text.strip(), flags=re.IGNORECASE).strip()
     return json.loads(texto_json)
 
 # =========================================================
-# BANCO DE DADOS E HANDLERS
+# HANDLERS DO TELEGRAM
 # =========================================================
-def salvar_perfil(tid, d):
-    d["telegram_id"] = str(tid)
-    db_client.table("user_profiles").upsert(d, on_conflict="telegram_id").execute()
-
-def buscar_usuario(tid):
-    try:
-        r = db_client.table("user_profiles").select("*").eq("telegram_id", str(tid)).execute()
-        return r.data[0] if r.data and len(r.data) > 0 else None
-    except Exception as e:
-        logger.error(f"Erro buscar_usuario: {e}")
-        return None
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = buscar_usuario(update.effective_user.id)
+    u = get_user_by_telegram(update.effective_user.id)
     if u and u.get("email"):
-        await update.message.reply_text("Bem-vindo de volta! Seu perfil ja esta configurado.\n\n"
-                                        "1. Envie ou cole seu Historico Profissional.\n"
-                                        "2. Cole a Descricao da Vaga.\n"
-                                        "O idioma e a formatacao ideal serao aplicados automaticamente.")
+        await update.message.reply_text("Bem-vindo de volta! Seu perfil basico ja esta configurado.\n\n"
+                                        "1. Envie ou cole seu Historico Profissional para atualizar o banco de dados.\n"
+                                        "2. Cole a Descricao da Vaga para gerar o PDF direcionado.\n")
         return ConversationHandler.END
     
     await update.message.reply_text("Bem-vindo ao Gerador de Curriculos ATS.\n\nQual o seu E-MAIL profissional?")
@@ -353,36 +451,40 @@ async def ask_phone(u, c):
     return ASK_LINKEDIN
 
 async def ask_linkedin(u, c):
-    # Recupera o nome de usuario do Telegram para preencher o nome no CV padrao
     nome_usuario = u.effective_user.full_name or "Candidato"
-    salvar_perfil(u.effective_user.id, {
+    save_user_base(u.effective_user.id, {
         "nome": nome_usuario,
         "email": c.user_data['e'], 
         "telefone": c.user_data['t'], 
         "linkedin": u.message.text
     })
-    await u.message.reply_text("Perfil salvo! Envie seu historico (.pdf, .txt ou texto livre) e depois a vaga.")
+    await u.message.reply_text("Perfil salvo! Envie seu historico (.pdf, .docx, .txt ou texto livre) para criar seu banco de dados, e depois envie uma vaga.")
     return ConversationHandler.END
 
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    usuario = buscar_usuario(user_id)
+    user_id_telegram = update.effective_user.id
+    usuario = get_user_by_telegram(user_id_telegram)
     if not usuario or not usuario.get("email"):
         await update.message.reply_text("Use o comando /start para iniciar.")
         return
 
-    status = await update.message.reply_text("Analisando seus dados...")
+    status = await update.message.reply_text("Analisando dados e consultando banco de dados...")
     
+    # Salva entrada bruta
     if update.message.document:
         f = await context.bot.get_file(update.message.document.file_id)
         b = bytearray(); await f.download_as_bytearray(out=b)
         texto = extrair_texto_de_arquivo(b, update.message.document.file_name)
+        tipo_raw = update.message.document.file_name.split('.')[-1].lower() if '.' in update.message.document.file_name else 'arquivo'
     else:
         texto = update.message.text
+        tipo_raw = 'texto'
 
     if not texto.strip():
-        await status.edit_text("Nenhum texto detectado no envio.")
+        await status.edit_text("Nenhum texto compativel detectado no envio.")
         return
+
+    db_client.table("raw_inputs").insert({"user_id": usuario["id"], "tipo": tipo_raw[:50], "conteudo_texto": texto}).execute()
 
     from google.genai import errors as genai_errors
 
@@ -391,16 +493,25 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         intencao = classificacao.get("intencao", "VAGA")
         idioma_detectado = classificacao.get("idioma", "Ingles")
         
+        perfil_atual_str = fetch_full_user_profile(usuario["id"])
+
         if intencao == "HISTORICO":
-            novo_h = consolidar_historico_llm(usuario.get("raw_history", ""), texto)
-            salvar_perfil(user_id, {"raw_history": novo_h})
-            await status.edit_text("Historico atualizado com sucesso! Agora voce pode enviar a descricao da vaga.")
+            await status.edit_text("Atualizando tabelas relacionais do seu perfil profissional...")
+            
+            parsed_json = extrair_e_mesclar_historico(perfil_atual_str, texto)
+            save_parsed_history_to_db(usuario["id"], parsed_json)
+            
+            await status.edit_text("Banco de dados atualizado com sucesso! Agora voce pode enviar a descricao da vaga.")
         else:
-            if not usuario.get("raw_history"):
+            if not perfil_atual_str or len(perfil_atual_str) < 50:
                 await status.edit_text("Envie seu historico profissional antes de mandar a vaga."); return
             
-            await status.edit_text(f"Vaga detectada! Gerando curriculo focado em {idioma_detectado}...")
-            dados = gerar_curriculo_json(usuario["raw_history"], texto, usuario, idioma_detectado)
+            await status.edit_text(f"Vaga detectada. Adequando curriculo para o idioma {idioma_detectado}...")
+            dados = gerar_curriculo_json(perfil_atual_str, texto, usuario, idioma_detectado)
+            
+            # Salva o historico de geracao
+            db_client.table("generated_resumes").insert({"user_id": usuario["id"], "vaga_texto": texto, "idioma": idioma_detectado, "json_gerado": dados}).execute()
+
             pdf = gerar_pdf(dados)
             nome = safe_string(dados.get("identificacao", {}).get("nome", "Candidato")).replace(" ", "_")
             await update.message.reply_document(document=pdf, filename=f"CV_{nome}_ATS.pdf")
@@ -408,18 +519,18 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except genai_errors.ClientError as e:
         if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-            await status.edit_text("Servidor sobrecarregado por limite de cota. Aguarde 1 minuto.")
+            await status.edit_text("Servidor da IA sobrecarregado. Aguarde 1 minuto e tente novamente.")
         else:
-            logger.error(f"Erro da API do Gemini: {e}")
+            logger.error(f"Erro da API: {e}")
             await status.edit_text("Ocorreu um erro ao comunicar com a IA.")
             
     except json.JSONDecodeError as e:
         logger.error(f"Erro JSON: {e}")
-        await status.edit_text("A Inteligencia Artificial falhou ao formatar o documento final.")
+        await status.edit_text("Falha estrutural de JSON no modelo. Tente novamente.")
         
     except Exception as e:
         logger.error(f"Erro: {e}", exc_info=True)
-        await status.edit_text("Erro interno ao gerar o PDF da sua aplicacao.")
+        await status.edit_text("Erro interno ao processar os dados ou gerar o PDF.")
 
 def main():
     threading.Thread(target=start_health_server, daemon=True).start()
