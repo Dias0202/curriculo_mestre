@@ -46,11 +46,11 @@ SCHEMA OBRIGATORIO:
   ],
   "educacao": [
     {
-      "grau": "Bacharelado/Mestrado/Tecnologo",
+      "grau": "Nível acadêmico",
+      "curso": "Nome do curso original + Enfoque direcionado à vaga (ex: Microbiologia com enfoque em Data Science)",
       "instituicao": "Nome da Instituicao",
       "ano_inicio": "Ano",
-      "ano_fim": "Ano",
-      "cursos_relevantes": ["Mencionar apenas se relevante para a vaga"]
+      "ano_fim": "Ano"
     }
   ],
   "certificacoes": ["Nome da Certificacao - Emissor - Ano"],
