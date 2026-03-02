@@ -22,7 +22,6 @@ from fpdf import FPDF
 from supabase import create_client, Client
 import docx
 
-# Importação do módulo de extração (deve estar no mesmo diretório)
 from scraper_vagas import extrair_vaga_linkedin_prod
 
 # =========================================================
@@ -110,6 +109,34 @@ def extrair_texto_de_arquivo(file_bytes: bytearray, filename: str) -> str:
 
     return texto_extraido.replace('\x00', ' ').strip()
 
+def auditar_perfil(parsed_json: dict) -> str:
+    """Valida o JSON retornado pelo parser procurando chaves vazias ou nulas em campos criticos."""
+    gaps = []
+    
+    for ed in parsed_json.get("education", []):
+        grau = ed.get("grau", "Formação")
+        if not ed.get("ano_inicio"):
+            gaps.append(f"- O ano de início do seu {grau} na {ed.get('instituicao', 'instituição')} não foi informado.")
+        if not ed.get("ano_fim"):
+            gaps.append(f"- O ano de conclusão do seu {grau} na {ed.get('instituicao', 'instituição')} não foi informado.")
+        if not ed.get("curso") or len(str(ed.get("curso")).strip()) < 2:
+            gaps.append(f"- A área de estudo/curso do seu {grau} na {ed.get('instituicao', 'instituição')} está ausente.")
+
+    for exp in parsed_json.get("experiences", []):
+        cargo = exp.get("cargo", "Cargo")
+        empresa = exp.get("empresa", "Empresa")
+        if not exp.get("data_inicio"):
+            gaps.append(f"- A data de início na experiência de {cargo} ({empresa}) está ausente.")
+        if not exp.get("data_fim"):
+            gaps.append(f"- A data de término na experiência de {cargo} ({empresa}) está ausente.")
+
+    if gaps:
+        msg = "Dados processados. No entanto, percebi que em seu histórico faltam algumas informações estruturais cruciais:\n\n"
+        msg += "\n".join(gaps)
+        msg += "\n\nPor favor, forneça esses dados em sua próxima mensagem para que eu possa atualizar as tabelas do seu perfil adequadamente."
+        return msg
+    return "Concluído. O banco de dados foi integrado. O sistema está pronto para processar os requisitos de uma vaga."
+
 # =========================================================
 # OPERACOES DE BANCO DE DADOS RELACIONAL (SUPABASE)
 # =========================================================
@@ -177,7 +204,8 @@ def save_parsed_history_to_db(user_uuid: str, parsed_json: dict):
             if bullets:
                 db_client.table("experience_bullets").insert(bullets).execute()
 
-    edu_list = [{"user_id": user_uuid, "grau": ed.get("grau"), "instituicao": ed.get("instituicao"), "ano_inicio": ed.get("ano_inicio"), "ano_fim": ed.get("ano_fim")} for ed in parsed_json.get("education", [])]
+    # Adicionada extracao da chave 'curso'
+    edu_list = [{"user_id": user_uuid, "grau": ed.get("grau"), "curso": ed.get("curso"), "instituicao": ed.get("instituicao"), "ano_inicio": ed.get("ano_inicio"), "ano_fim": ed.get("ano_fim")} for ed in parsed_json.get("education", [])]
     if edu_list: db_client.table("education").insert(edu_list).execute()
 
     skill_list = [{"user_id": user_uuid, "nome": sk.get("nome"), "categoria": sk.get("categoria"), "nivel": sk.get("nivel")} for sk in parsed_json.get("skills", [])]
@@ -321,8 +349,15 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
             if not isinstance(item, dict): continue
             pdf.set_font("helvetica", "B", 11)
             grau = safe_string(item.get("grau", ""))
+            curso = safe_string(item.get("curso", ""))
             inst = safe_string(item.get("instituicao", ""))
-            header = f"{grau} - {inst}" if grau and inst else grau or inst
+            
+            # Formata a string de cabecalho incluindo o curso
+            if curso:
+                header = f"{grau} em {curso} - {inst}" if grau and inst else curso or inst
+            else:
+                header = f"{grau} - {inst}" if grau and inst else grau or inst
+                
             pdf.multi_cell(0, 6, sanitize(header), new_x="LMARGIN", new_y="NEXT")
             
             pdf.set_font("helvetica", "I", 10)
@@ -510,7 +545,6 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if resultado_scraper.get("sucesso"):
             vaga_dados = resultado_scraper["dados"]
-            # Substitui a URL pela string estruturada da vaga para analise do LLM
             texto = f"Titulo da Vaga: {vaga_dados['titulo']}\nEmpresa: {vaga_dados['empresa']}\nLocalizacao: {vaga_dados['localizacao']}\n\nDescricao:\n{vaga_dados['descricao']}"
             await status.edit_text("Extracao concluida. Direcionando dados para classificacao semantica do modelo de linguagem...")
         else:
@@ -539,12 +573,15 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         perfil_atual_str = fetch_full_user_profile(usuario["id"])
 
         if intencao == "HISTORICO":
-            await status.edit_text("Atualizando as tabelas relacionais do seu perfil com os novos dados...")
+            await status.edit_text("Atualizando as tabelas relacionais do seu perfil e processando auditoria de dados...")
             
             parsed_json = extrair_e_mesclar_historico(perfil_atual_str, texto)
             save_parsed_history_to_db(usuario["id"], parsed_json)
             
-            await status.edit_text("Concluido. O banco de dados foi integrado. O sistema esta pronto para processar os requisitos de uma vaga.")
+            # Auditoria e feedback de dados ausentes
+            mensagem_feedback = auditar_perfil(parsed_json)
+            await status.edit_text(mensagem_feedback)
+            
         else:
             if not perfil_atual_str or len(perfil_atual_str) < 50:
                 await status.edit_text("Base de dados insuficiente. Carregue o seu historico profissional antes de prosseguir."); return
@@ -552,7 +589,6 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text(f"Iniciando a geracao e traducao do documento ATS para: {idioma_detectado}.")
             dados = gerar_curriculo_json(perfil_atual_str, texto, usuario, idioma_detectado)
             
-            # Remocao da chave extra para n quebrar o construtor JSON do Supabase
             json_para_banco = {k: v for k, v in dados.items() if k != "relatorio_analitico"}
             db_client.table("generated_resumes").insert({
                 "user_id": usuario["id"], 
