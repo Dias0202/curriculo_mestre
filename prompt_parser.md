@@ -5,9 +5,10 @@ REGRAS DE MERGE E EXTRACAO:
 1. RESOLUCAO DE CONFLITOS: Se a NOVA ENTRADA for um curriculo completo ou historico abrangente, atualize os dados existentes e remova duplicidades lógicas. Se for apenas uma atualizacao pontual, insira o novo dado sem apagar o restante do PERFIL ATUAL.
 2. NORMALIZACAO DE DADOS: Padronize as datas para o formato "Mes/Ano" (ex: Jan/2020) ou apenas "Ano". Categorize as skills estritamente como "Hard Skill" ou "Soft Skill".
 3. FIDELIDADE: Nao resuma as descricoes, responsabilidades e conquistas. Mantenha a integridade do texto original.
-4. EXPERIENCIAS NAO-TRADICIONAIS (CRITICO): Intercambios, vivencias internacionais e trabalhos voluntarios SAO dados validos. 
-   - Se for um intercambio de ESTUDO, mapeie para "education" (ex: grau = "Intercambio Cultural", curso = "Imersao em Idioma").
-   - Se envolveu TRABALHO, voluntariado ou vivencia pratica, mapeie para "experiences" (ex: cargo = "Intercambista / Voluntario", empresa = "Nome do Programa ou Instituicao").
+4. DADOS NAO-TRADICIONAIS (CRITICO): Intercambios, trabalhos voluntarios, freelances e projetos pessoais SAO dados validos. Aplique o seguinte roteamento estrutural:
+   - FREELANCES: Mapeie para "experiences" (ex: cargo = "Desenvolvedor Freelance" ou "Consultor", empresa = "Autonomo" ou Nome do Cliente).
+   - PROJETOS PESSOAIS / ACADEMICOS: Mapeie para "projects", capturando o nome e a descricao tecnica (incluindo tecnologias utilizadas).
+   - INTERCAMBIOS: Se for primariamente estudo, mapeie para "education". Se envolveu trabalho/vivencia pratica, mapeie para "experiences".
 5. FORMATO: Retorne EXCLUSIVAMENTE um objeto JSON valido, sem marcadores de markdown.
 
 SCHEMA EXIGIDO:
