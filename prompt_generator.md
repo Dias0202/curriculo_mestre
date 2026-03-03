@@ -5,7 +5,7 @@ REGRAS VITAIS E ALGORITMICAS:
 1. MAPEAMENTO DE PALAVRAS-CHAVE (ATS SEO): Analise a VAGA ALVO, identifique as hard skills, soft skills e ferramentas exigidas. Injete essas exatas palavras-chave de forma organica e contextualizada no "resumo", "competencias" e "responsabilidades" do candidato, SEMPRE que o historico original der suporte a isso.
 2. PREVENCAO DE ALUCINACAO (STRICT FACTUALITY): NUNCA invente experiencias, cargos, ferramentas ou graduacoes que nao existam no HISTORICO do candidato. Se o candidato nao possui um requisito da vaga, omita-o do curriculo e liste-o em "analise_gaps".
 3. METODO STAR OTIMIZADO: Reescreva os "bullet points" de experiencias focando em impacto quantificavel (Situacao, Tarefa, Acao, Resultado). Inicie sempre com verbos de acao fortes.
-4. FILTRAGEM CIRURGICA: Oculte experiencias e habilidades do historico que sejam absolutamente irrelevantes para a VAGA ALVO, priorizando a densidade de informacao util.
+4. ALAVANCAGEM DE BACKGROUND (CRITICO): Valorize intensamente Projetos Pessoais, Academicos e trabalhos Freelance. Use-os estrategicamente no curriculo gerado para compensar eventuais faltas de experiencia formal nas palavras-chave exigidas pela vaga.
 5. IDIOMA: Todo o conteudo gerado deve ser rigorosamente redigido e traduzido para: {idioma_detectado}.
 6. FORMATO STRICT JSON: Retorne apenas o JSON puro, sem formatacao markdown, sem explicacoes adicionais.
 
@@ -34,8 +34,8 @@ SCHEMA OBRIGATORIO:
   "competencias": ["Palavra-chave 1", "Palavra-chave 2", "Palavra-chave 3 (Priorize termos exatos da vaga)"],
   "experiencias": [
     {
-      "cargo": "Nome do Cargo",
-      "empresa": "Nome da Empresa",
+      "cargo": "Nome do Cargo (Se for freelance, inclua 'Freelance' ou 'Consultor' no titulo)",
+      "empresa": "Nome da Empresa (Ou 'Autonomo' / Nome do Cliente)",
       "localizacao": "Local",
       "data_inicio": "Mes/Ano",
       "data_fim": "Mes/Ano ou Presente",
@@ -56,8 +56,8 @@ SCHEMA OBRIGATORIO:
   "certificacoes": ["Nome da Certificacao - Emissor - Ano"],
   "projetos": [
     {
-      "nome": "Nome do Projeto",
-      "descricao": "Descricao focada em resolucao de problemas e tecnologias alinhadas a vaga"
+      "nome": "Nome do Projeto (Seja Pessoal, Academico ou Open-Source)",
+      "descricao": "Descricao focada em resolucao de problemas, tecnologias alinhadas a vaga e link do repositorio se existir"
     }
   ],
   "idiomas": ["Idioma - Nivel"],
