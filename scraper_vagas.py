@@ -32,7 +32,7 @@ def _headers() -> dict:
 
 
 def _cache_get(job_id: str, db_client) -> dict | None:
-    """Tenta o cache em DB primeiro, depois em memória."""
+    """Tenta o cache no Supabase primeiro, depois em memória."""
     if db_client:
         try:
             r = db_client.table("scraped_jobs").select("dados").eq("job_id", job_id).execute()
@@ -62,7 +62,7 @@ def _cache_set(job_id: str, dados: dict, db_client) -> None:
 def extrair_vaga_linkedin_prod(url_fornecida: str, db_client=None, max_tentativas: int = 2) -> dict:
     """
     Extrai dados de vaga do LinkedIn via Guest API.
-    - db_client (opcional): instância Supabase para cache persistente.
+    - db_client (opcional): instância Supabase para cache persistente entre restarts.
     - Fallback: cache em memória RAM.
     """
     match_id = re.search(r"([0-9]{9,10})", url_fornecida)
@@ -102,19 +102,19 @@ def extrair_vaga_linkedin_prod(url_fornecida: str, db_client=None, max_tentativa
         el = soup.find(tag, class_=cls)
         return el.text.strip() if el else "Não encontrado"
 
-    titulo = _get("h2", "top-card-layout__title")
-    empresa = _get("a", "topcard__org-name-link")
+    titulo    = _get("h2", "top-card-layout__title")
+    empresa   = _get("a",  "topcard__org-name-link")
     localizacao = _get("span", "topcard__flavor topcard__flavor--bullet")
 
     descricao_html = soup.find("div", class_="show-more-less-html__markup")
     descricao = descricao_html.get_text(separator="\n", strip=True) if descricao_html else "Não encontrado"
 
     dados = {
-        "id": job_id,
-        "titulo": titulo,
-        "empresa": empresa,
-        "localizacao": localizacao,
-        "descricao": descricao,
+        "id":           job_id,
+        "titulo":       titulo,
+        "empresa":      empresa,
+        "localizacao":  localizacao,
+        "descricao":    descricao,
         "url_original": url_fornecida,
     }
 
