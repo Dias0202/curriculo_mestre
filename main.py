@@ -8,11 +8,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dotenv import load_dotenv
 from groq import Groq
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
     ConversationHandler,
@@ -424,8 +425,21 @@ def extrair_e_mesclar_historico(perfil_atual_str: str, nova_entrada: str) -> dic
 def gerar_curriculo_json(hist: str, vaga: str, perfil: dict, idioma: str) -> dict:
     with open("prompt_generator.md", "r", encoding="utf-8") as f:
         template = f.read()
+
+    # Instrução de tradução total — injetada no topo do prompt para máxima prioridade
+    traducao_header = (
+        f"INSTRUÇÃO CRÍTICA DE IDIOMA: Todo o conteúdo do JSON de saída — sem exceção — "
+        f"deve ser redigido em {idioma}. Isso inclui: resumo, competências, responsabilidades, "
+        f"conquistas, descrições de projetos, nomes de seções (cabecalhos), graus acadêmicos, "
+        f"níveis de idioma e qualquer outro campo textual. "
+        f"NÃO deixe nenhuma palavra, frase ou campo em outro idioma que não seja {idioma}. "
+        f"Traduza inclusive os nomes de seções como 'resumo', 'competencias', 'experiencias', "
+        f"'educacao', 'certificacoes', 'projetos' e 'idiomas' para {idioma}.\n\n"
+    )
+
     prompt = (
-        template
+        traducao_header
+        + template
         .replace("{idioma_detectado}", safe_string(idioma))
         .replace("{nome}",      safe_string(perfil.get("nome")))
         .replace("{telefone}",  safe_string(perfil.get("telefone")))
@@ -518,6 +532,84 @@ def formatar_perfil_markdown(usuario: dict, perfil_str: str) -> str:
     linhas.append("_Para editar: descreva a alteração em texto livre._")
     linhas.append("_Ex: \"Remova a experiência na empresa X\" ou \"Atualize meu telefone para...\"_")
     return "\n".join(linhas)
+
+# =========================================================
+# MENU DE OPÇÕES — BOTÕES CLICÁVEIS
+# =========================================================
+def menu_opcoes() -> InlineKeyboardMarkup:
+    """Retorna o teclado inline com as ações disponíveis do bot."""
+    botoes = [
+        [
+            InlineKeyboardButton("📤 Enviar Currículo",     callback_data="menu_historico"),
+            InlineKeyboardButton("🔍 Enviar Vaga",          callback_data="menu_vaga"),
+        ],
+        [
+            InlineKeyboardButton("👤 Ver Meu Perfil",       callback_data="menu_perfil"),
+            InlineKeyboardButton("✏️ Editar Perfil",        callback_data="menu_edicao"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Deletar Meus Dados",   callback_data="menu_deletar"),
+        ],
+    ]
+    return InlineKeyboardMarkup(botoes)
+
+_INSTRUCOES = {
+    "menu_historico": (
+        "📤 *Enviar Currículo / Histórico*\n\n"
+        "Envie seu currículo nos formatos:\n"
+        "• Arquivo *.pdf*, *.docx* ou *.txt*\n"
+        "• Texto colado diretamente no chat\n\n"
+        "O sistema extrai e salva automaticamente suas experiências, formação, skills e projetos."
+    ),
+    "menu_vaga": (
+        "🔍 *Enviar Vaga para Gerar Currículo*\n\n"
+        "Envie de duas formas:\n"
+        "• *Link do LinkedIn*: cole a URL da vaga diretamente\n"
+        "• *Texto da vaga*: copie e cole a descrição completa\n\n"
+        "O bot gera um PDF otimizado para ATS com match score e dica de entrevista."
+    ),
+    "menu_perfil": None,   # Aciona cmd_meuperfil diretamente
+    "menu_edicao": (
+        "✏️ *Editar Perfil*\n\n"
+        "Descreva em texto livre o que deseja alterar. Exemplos:\n"
+        "• _\"Remova minha experiência na empresa X\"_\n"
+        "• _\"Atualize meu telefone para (31) 99999-9999\"_\n"
+        "• _\"Adicione o projeto Y com a descrição Z\"_\n\n"
+        "O sistema aplica a edição de forma cirúrgica sem apagar o restante do perfil."
+    ),
+    "menu_deletar": (
+        "🗑 *Deletar Dados*\n\n"
+        "Para remover *todos* os seus dados permanentemente, use o comando:\n\n"
+        "/deletar\n\n"
+        "⚠️ Esta ação é irreversível."
+    ),
+}
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Responde aos cliques nos botões do menu."""
+    query = update.callback_query
+    await query.answer()
+    data  = query.data
+
+    if data == "menu_perfil":
+        # Reutiliza a lógica do /meuperfil
+        usuario = get_user_by_telegram(query.from_user.id)
+        if not usuario or not usuario.get("email"):
+            await query.message.reply_text("Cadastro ausente. Use /start para configurar sua conta.")
+            return
+        await query.message.reply_text("🔍 Carregando seu perfil...")
+        perfil_str = fetch_full_user_profile(usuario["id"])
+        texto      = formatar_perfil_markdown(usuario, perfil_str)
+        if len(texto) > 4000:
+            partes = [texto[i:i + 4000] for i in range(0, len(texto), 4000)]
+            for parte in partes:
+                await query.message.reply_text(parte, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await query.message.reply_text(texto, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    msg = _INSTRUCOES.get(data, "Opção não reconhecida.")
+    await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 # =========================================================
 # HANDLERS DO TELEGRAM
@@ -656,8 +748,10 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # --- IRRELEVANTE ---
         if intencao == "IRRELEVANTE":
             await status.edit_text(
-                f"Olá, {nome_usuario}! O sistema processa históricos profissionais e vagas. "
-                "Envie um currículo ou a descrição de uma vaga para continuar."
+                f"Olá, {nome_usuario}\\! 👋 Não reconheci uma vaga ou histórico profissional\\.\n\n"
+                "Selecione uma das opções abaixo para continuar:",
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=menu_opcoes(),
             )
             return
 
@@ -769,6 +863,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler("deletar",   cmd_deletar))
     app.add_handler(CommandHandler("meuperfil", cmd_meuperfil))
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^menu_"))
     app.add_handler(
         MessageHandler(
             filters.Document.ALL | (filters.TEXT & ~filters.COMMAND),
