@@ -582,6 +582,25 @@ async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
     logger.info("[Scheduler] Envio de sugestoes diarias concluido.")
 
 # =========================================================
+# COMANDO DE TESTE — /testar_vagas
+# Dispara o envio imediato para TODOS os usuarios cadastrados.
+# Util para validar o fluxo sem esperar o meio-dia.
+# =========================================================
+async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    logger.info(f"[Teste] /testar_vagas acionado por user_id={user_id}")
+
+    await update.message.reply_text(
+        "Iniciando envio de teste para todos os usuarios cadastrados...\n"
+        "Aguarde, isso pode levar alguns minutos dependendo do numero de usuarios."
+    )
+
+    # Reutiliza exatamente a mesma funcao do scheduler diario
+    await enviar_sugestoes_diarias(context)
+
+    await update.message.reply_text("Envio de teste concluido!")
+
+# =========================================================
 # CONVERSATION HANDLER — ONBOARDING
 # =========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -751,6 +770,119 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.delete()
 
 
+async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando de teste: dispara o job de sugestoes diarias imediatamente
+    apenas para o usuario que enviou o comando.
+    """
+    user_id = update.effective_user.id
+    logger.info(f"[Teste] /testar_vagas acionado por user_id={user_id}")
+
+    usuario = buscar_usuario(user_id)
+    if not usuario or not usuario.get("raw_history"):
+        await update.message.reply_text(
+            "Voce ainda nao tem historico salvo.\n"
+            "Envie primeiro um .txt ou .pdf com seu historico profissional."
+        )
+        return
+
+    await update.message.reply_text("Buscando vagas para o seu perfil... Aguarde.")
+
+    # Reutiliza exatamente o mesmo fluxo do job diario, mas so para este usuario
+    class FakeContext:
+        """Contexto minimo para reusar enviar_sugestoes_diarias com um unico usuario."""
+        def __init__(self, bot):
+            self.bot = bot
+
+    # Filtra a lista de todos os usuarios para conter apenas o usuario atual
+    todos = buscar_todos_usuarios()
+    usuario_atual = [u for u in todos if u.get("telegram_id") == str(user_id)]
+
+    if not usuario_atual:
+        await update.message.reply_text("Perfil nao encontrado no banco. Use /start.")
+        return
+
+    # Injeta o bot real no contexto fake e chama o job diretamente
+    fake_ctx = FakeContext(bot=context.bot)
+
+    # Salva lista original e substitui temporariamente
+    import types
+
+    async def _rodar_para_um_usuario(ctx):
+        historico = usuario_atual[0].get("raw_history", "")
+        cidade    = usuario_atual[0].get("cidade", "Brazil")
+        telegram_id = str(user_id)
+
+        try:
+            perfil_keywords   = extrair_keywords_perfil(historico)
+            cargo             = perfil_keywords.get("cargo", "")
+            keywords          = perfil_keywords.get("keywords", "")
+            vagas_encontradas = buscar_vagas_linkedin(cargo, keywords, cidade, quantidade=10)
+
+            if not vagas_encontradas:
+                await ctx.bot.send_message(
+                    chat_id=telegram_id,
+                    text="Nenhuma vaga encontrada para o seu perfil agora. Tente mais tarde."
+                )
+                return
+
+            melhores_vagas = selecionar_melhores_vagas(historico, vagas_encontradas)
+            vagas_novas    = [
+                v for v in melhores_vagas
+                if not job_ja_enviado(telegram_id, gerar_hash_vaga(v))
+            ]
+
+            if not vagas_novas:
+                await ctx.bot.send_message(
+                    chat_id=telegram_id,
+                    text="As melhores vagas para hoje ja foram enviadas anteriormente."
+                )
+                return
+
+            await ctx.bot.send_message(
+                chat_id=telegram_id,
+                text=f"Aqui estao suas {len(vagas_novas)} sugestao(es) de vaga com curriculo adaptado:"
+            )
+
+            for i, vaga in enumerate(vagas_novas, start=1):
+                job_hash       = gerar_hash_vaga(vaga)
+                descricao_vaga = (
+                    f"{vaga.get('title','')} em {vaga.get('company','')}\n"
+                    f"Local: {vaga.get('location','')}\n\n"
+                    f"{vaga.get('description','')}"
+                )
+                dados_cv     = gerar_curriculo_json(historico, descricao_vaga, usuario_atual[0])
+                pdf_buf      = gerar_pdf(dados_cv)
+                nome         = dados_cv.get("contato", {}).get("nome", "Candidato")
+                nome_arquivo = f"CV_{nome.replace(' ','_')}_{vaga.get('company','').replace(' ','_')}.pdf"
+
+                caption = (
+                    f"Vaga {i}: {vaga.get('title','')}\n"
+                    f"Empresa: {vaga.get('company','')}\n"
+                    f"Local: {vaga.get('location','')}\n"
+                )
+                if vaga.get("job_url") and vaga["job_url"] != "nan":
+                    caption += f"Link: {vaga['job_url']}"
+
+                await ctx.bot.send_document(
+                    chat_id=telegram_id,
+                    document=pdf_buf,
+                    filename=nome_arquivo,
+                    caption=caption,
+                )
+                registrar_job_enviado(telegram_id, job_hash, vaga.get("title",""), vaga.get("company",""))
+                logger.info(f"[Teste] Vaga enviada: {vaga.get('title')}")
+
+        except Exception as e:
+            logger.error(f"[Teste] Erro: {e}", exc_info=True)
+            await ctx.bot.send_message(
+                chat_id=telegram_id,
+                text=f"Erro durante o teste: {e}"
+            )
+
+    await _rodar_para_um_usuario(fake_ctx)
+
+
 async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"[Erro Global] {context.error}", exc_info=context.error)
 
@@ -806,6 +938,7 @@ def main():
     )
 
     app.add_handler(conv)
+    app.add_handler(CommandHandler("testar_vagas", cmd_testar_vagas))
     app.add_handler(
         MessageHandler(
             filters.Document.ALL | (filters.TEXT & ~filters.COMMAND),
