@@ -6,3 +6,5 @@ httpx
 python-dotenv
 pypdf>=5.0.0
 python-jobspy>=1.1.80
+beautifulsoup4>=4.12.0
+requests>=2.31.0
