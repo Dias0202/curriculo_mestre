@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo  # Python 3.9+ nativo, sem dependencia extra
 
 from dotenv import load_dotenv
-from google import genai
+from groq import Groq
 from telegram import Update, Bot
 from telegram.ext import (
     Application,
@@ -40,19 +40,19 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY",  "").strip()
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY",    "").strip()
 SUPABASE_URL    = os.getenv("SUPABASE_URL",    "").strip()
 SUPABASE_KEY    = os.getenv("SUPABASE_KEY",    "").strip()
 
-if not all([TELEGRAM_TOKEN, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
+if not all([TELEGRAM_TOKEN, GROQ_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
     logger.error("ERRO CRITICO: Variaveis de ambiente ausentes.")
     raise SystemExit(1)
 
 # =========================================================
 # CLIENTES EXTERNOS
 # =========================================================
-llm_client: genai.Client = genai.Client(api_key=GEMINI_API_KEY)
-db_client:  Client       = create_client(SUPABASE_URL, SUPABASE_KEY)
+llm_client: Groq = Groq(api_key=GROQ_API_KEY)
+db_client:  Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =========================================================
 # SERVIDOR WEB — KEEP-ALIVE (Render.com)
@@ -211,9 +211,32 @@ def gerar_pdf(dados: dict) -> io.BytesIO:
     return buf
 
 # =========================================================
-# INTEGRACAO GEMINI
+# INTEGRACAO GROQ
+# Modelo: llama-3.3-70b-versatile — melhor custo/beneficio gratuito
+# API compativel com OpenAI: client.chat.completions.create()
 # =========================================================
-_MODEL  = "gemini-2.5-flash"
+_MODEL = "llama-3.3-70b-versatile"
+
+
+def _chat(system: str, prompt: str, json_mode: bool = False, temperature: float = 0.1) -> str:
+    """
+    Helper centralizado para todas as chamadas ao Groq.
+    json_mode=True ativa response_format JSON garantido.
+    """
+    kwargs = dict(
+        model=_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt},
+        ],
+        temperature=temperature,
+        max_tokens=4096,
+    )
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    resp = llm_client.chat.completions.create(**kwargs)
+    return resp.choices[0].message.content.strip()
 
 _SCHEMA = """{
   "contato": {"nome":"","email":"","telefone":"","linkedin":"","cidade":""},
@@ -235,113 +258,93 @@ _SYSTEM_CV = (
 
 
 def classificar_intencao_llm(texto: str) -> str:
-    prompt = (
-        "Classifique como 'VAGA' (descricao de cargo) ou 'HISTORICO' (perfil/curriculo). "
-        "Responda APENAS: VAGA ou HISTORICO.\n\n"
-        f"{texto[:1500]}"
+    raw = _chat(
+        system="Voce classifica textos profissionais. Responda APENAS com uma palavra: VAGA ou HISTORICO.",
+        prompt=(
+            "Classifique como 'VAGA' (descricao de cargo/emprego) "
+            "ou 'HISTORICO' (historico profissional/curriculo de uma pessoa).\n\n"
+            f"{texto[:1500]}"
+        ),
+        temperature=0.0,
     )
-    resp = llm_client.models.generate_content(
-        model=_MODEL,
-        contents=prompt,
-        config=genai.types.GenerateContentConfig(temperature=0.0),
-    )
-    return "VAGA" if "VAGA" in resp.text.upper() else "HISTORICO"
+    return "VAGA" if "VAGA" in raw.upper() else "HISTORICO"
 
 
 def consolidar_historico_llm(atual: str, novo: str) -> str:
     if not atual:
         return novo
-    prompt = (
-        "Mescle ao historico atual as novas informacoes, removendo duplicatas. "
-        "Retorne apenas o texto consolidado.\n\n"
-        f"ATUAL:\n{atual}\n\nNOVO:\n{novo}"
+    return _chat(
+        system="Voce e um assistente de RH. Consolide historicos profissionais sem inventar dados.",
+        prompt=(
+            "Mescle ao historico atual as novas informacoes, removendo duplicatas. "
+            "Retorne apenas o texto consolidado.\n\n"
+            f"ATUAL:\n{atual}\n\nNOVO:\n{novo}"
+        ),
+        temperature=0.0,
     )
-    return llm_client.models.generate_content(model=_MODEL, contents=prompt).text.strip()
 
 
 def extrair_keywords_perfil(historico: str) -> dict:
-    """
-    Extrai cargo-alvo e palavras-chave do historico para busca de vagas.
-    Retorna {"cargo": str, "keywords": str, "area": str}
-    """
-    prompt = (
-        "Analise o historico profissional abaixo e retorne um JSON com:\n"
-        '{"cargo": "cargo mais recente ou desejado", '
-        '"keywords": "3-5 palavras-chave tecnicas separadas por espaco", '
-        '"area": "area profissional resumida em 2 palavras"}\n'
-        "Retorne APENAS o JSON puro, sem markdown.\n\n"
-        f"{historico[:3000]}"
-    )
-    resp = llm_client.models.generate_content(
-        model=_MODEL,
-        contents=prompt,
-        config=genai.types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.0,
+    """Extrai cargo-alvo e palavras-chave do historico para busca de vagas."""
+    raw = _chat(
+        system='Voce extrai informacoes de historicos profissionais. Retorne SOMENTE JSON valido.',
+        prompt=(
+            "Analise o historico e retorne JSON com:\n"
+            '{"cargo": "cargo mais recente ou desejado", '
+            '"keywords": "3-5 palavras-chave tecnicas separadas por espaco", '
+            '"area": "area profissional em 2 palavras"}\n\n'
+            f"{historico[:3000]}"
         ),
+        json_mode=True,
+        temperature=0.0,
     )
-    raw = re.sub(r"```json|```", "", resp.text).strip()
     try:
-        return json.loads(raw)
+        return json.loads(re.sub(r"```json|```", "", raw).strip())
     except Exception:
         return {"cargo": "profissional", "keywords": "", "area": "geral"}
 
 
 def selecionar_melhores_vagas(historico: str, vagas: list) -> list:
-    """
-    Pede ao Gemini para rankear as vagas por aderencia ao perfil.
-    Retorna os indices das 2 melhores.
-    """
+    """Groq seleciona as 2 vagas com maior aderencia ao perfil."""
     lista_vagas = "\n".join([
         f"{i}. {v.get('title','')} - {v.get('company','')} ({v.get('location','')}): {v.get('description','')[:300]}"
         for i, v in enumerate(vagas)
     ])
-    prompt = (
-        "Dado o historico do candidato, selecione os indices das 2 vagas com MAIOR aderencia ao perfil. "
-        "Retorne APENAS um JSON: {\"indices\": [0, 1]} com os dois indices escolhidos.\n\n"
-        f"HISTORICO:\n{historico[:2000]}\n\n"
-        f"VAGAS:\n{lista_vagas}"
-    )
-    resp = llm_client.models.generate_content(
-        model=_MODEL,
-        contents=prompt,
-        config=genai.types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.0,
+    raw = _chat(
+        system='Voce e um recrutador tecnico. Retorne SOMENTE JSON valido.',
+        prompt=(
+            "Selecione os indices das 2 vagas com MAIOR aderencia ao perfil do candidato.\n"
+            'Retorne APENAS: {"indices": [0, 1]}\n\n'
+            f"HISTORICO:\n{historico[:2000]}\n\n"
+            f"VAGAS:\n{lista_vagas}"
         ),
+        json_mode=True,
+        temperature=0.0,
     )
-    raw = re.sub(r"```json|```", "", resp.text).strip()
     try:
-        resultado = json.loads(raw)
-        indices = resultado.get("indices", [0, 1])
-        # Garante que os indices existem na lista
+        indices = json.loads(re.sub(r"```json|```", "", raw).strip()).get("indices", [0, 1])
         return [vagas[i] for i in indices if i < len(vagas)][:2]
     except Exception:
         return vagas[:2]
 
 
 def gerar_curriculo_json(historico: str, vaga: str, perfil: dict) -> dict:
-    prompt = (
-        f"HISTORICO DO CANDIDATO:\n{historico}\n\n"
-        f"DESCRICAO DA VAGA:\n{vaga}\n\n"
-        f"CONTATOS: Email: {perfil.get('email','')}, "
-        f"Telefone: {perfil.get('telefone','')}, "
-        f"LinkedIn: {perfil.get('linkedin','')}, "
-        f"Cidade: {perfil.get('cidade','')}\n"
-        f"IDIOMA: {perfil.get('idioma', 'Portugues')}\n\n"
-        "Gere o curriculo otimizado no formato JSON especificado."
-    )
-    resp = llm_client.models.generate_content(
-        model=_MODEL,
-        contents=prompt,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=_SYSTEM_CV,
-            response_mime_type="application/json",
-            temperature=0.1,
+    raw = _chat(
+        system=_SYSTEM_CV,
+        prompt=(
+            f"HISTORICO DO CANDIDATO:\n{historico}\n\n"
+            f"DESCRICAO DA VAGA:\n{vaga}\n\n"
+            f"CONTATOS: Email: {perfil.get('email','')}, "
+            f"Telefone: {perfil.get('telefone','')}, "
+            f"LinkedIn: {perfil.get('linkedin','')}, "
+            f"Cidade: {perfil.get('cidade','')}\n"
+            f"IDIOMA: {perfil.get('idioma', 'Portugues')}\n\n"
+            "Gere o curriculo otimizado no formato JSON especificado."
         ),
+        json_mode=True,
+        temperature=0.1,
     )
-    raw = re.sub(r"```json|```", "", resp.text).strip()
-    return json.loads(raw)
+    return json.loads(re.sub(r"```json|```", "", raw).strip())
 
 # =========================================================
 # SCRAPER DE VAGAS — LINKEDIN (via python-jobspy, 100% gratuito)
