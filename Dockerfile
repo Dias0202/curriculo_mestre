@@ -12,12 +12,12 @@ RUN apt-get update && apt-get install -y \
 
 COPY requirements.txt .
 
-# Atualiza pip e instala dependencias
-# A flag --no-cache-dir evita conflitos de pacotes cached
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# Copia os dois modulos
 COPY main.py .
+COPY scraper.py .
 
 EXPOSE 10000
 
