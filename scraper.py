@@ -1,7 +1,7 @@
 """
 scraper.py — Extrator de vagas do LinkedIn
   - extrair_vaga_linkedin: Guest API publica (para URLs coladas pelo usuario)
-  - buscar_vagas_jobspy:   JobSpy scraper (para busca ativa diaria)
+  - buscar_vagas_jobspy:   JobSpy scraper com fallback multi-site e retry
 """
 
 import re
@@ -13,7 +13,6 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Cache em memoria como fallback (limpo a cada restart)
 _MEM_CACHE: dict = {}
 
 USER_AGENTS = [
@@ -38,7 +37,6 @@ def _headers() -> dict:
 
 
 def _cache_get(job_id: str, db_client) -> dict | None:
-    """Tenta o cache no Supabase primeiro, depois em memoria."""
     if db_client:
         try:
             r = db_client.table("scraped_jobs").select("dados").eq("job_id", job_id).execute()
@@ -54,7 +52,6 @@ def _cache_get(job_id: str, db_client) -> dict | None:
 
 
 def _cache_set(job_id: str, dados: dict, db_client) -> None:
-    """Salva no Supabase e na memoria."""
     _MEM_CACHE[job_id] = dados
     if db_client:
         try:
@@ -68,7 +65,6 @@ def _cache_set(job_id: str, dados: dict, db_client) -> None:
 def extrair_vaga_linkedin(url: str, db_client=None) -> dict:
     """
     Extrai dados de vaga do LinkedIn via Guest API publica.
-    Retorna {"sucesso": bool, "dados": dict, "erro": str, "origem": str}
     """
     match_id = re.search(r"([0-9]{9,10})", url)
     if not match_id:
@@ -120,47 +116,112 @@ def extrair_vaga_linkedin(url: str, db_client=None) -> dict:
     return {"sucesso": True, "dados": dados, "origem": "api_linkedin"}
 
 
+def _normalizar_location(cidade: str) -> str:
+    """
+    Normaliza a cidade para o formato que o JobSpy aceita melhor.
+    Remove estado (ex: 'Belo Horizonte, MG' -> 'Belo Horizonte')
+    e trata casos vazios.
+    """
+    if not cidade or cidade.strip().lower() in ("brazil", "brasil", ""):
+        return "Brazil"
+    # Remove sufixo ', UF' se presente (ex: 'Sao Paulo, SP' -> 'Sao Paulo')
+    partes = cidade.split(",")
+    return partes[0].strip()
+
+
+def _scrape_jobspy(site_name: list, search_term: str, location: str,
+                   results_wanted: int, hours_old: int) -> list:
+    """Helper interno que chama o JobSpy e retorna lista normalizada."""
+    from jobspy import scrape_jobs
+
+    logger.info(
+        f"[JobSpy] sites={site_name} | termo='{search_term}' "
+        f"| local='{location}' | hours_old={hours_old}"
+    )
+
+    df = scrape_jobs(
+        site_name=site_name,
+        search_term=search_term,
+        location=location,
+        results_wanted=results_wanted,
+        hours_old=hours_old,
+        country_indeed="Brazil",
+        linkedin_fetch_description=True,
+        verbose=0,
+    )
+
+    if df is None or df.empty:
+        return []
+
+    vagas = []
+    for _, row in df.iterrows():
+        title = str(row.get("title", "")).strip()
+        company = str(row.get("company", "")).strip()
+        if not title:
+            continue
+        vagas.append({
+            "title":       title,
+            "company":     company,
+            "location":    str(row.get("location", "")).strip(),
+            "description": str(row.get("description", ""))[:3000],
+            "job_url":     str(row.get("job_url", "")).strip(),
+        })
+
+    logger.info(f"[JobSpy] {len(vagas)} vagas encontradas com termo='{search_term}'")
+    return vagas
+
+
 def buscar_vagas_jobspy(cargo: str, keywords: str, cidade: str, quantidade: int = 10) -> list:
     """
-    Busca vagas no LinkedIn via JobSpy (scraper gratuito, sem autenticacao).
-    Retorna lista de dicts: title, company, location, description, job_url
+    Busca vagas com estrategia de fallback em 4 niveis:
+
+    Nivel 1 — LinkedIn, cargo (ate 3 palavras) + 1a keyword, cidade, 7 dias
+    Nivel 2 — LinkedIn + Indeed, apenas cargo curto, cidade, 30 dias
+    Nivel 3 — LinkedIn + Indeed, apenas cargo curto, Brasil, 30 dias
+    Nivel 4 — LinkedIn + Indeed + Glassdoor, 1a keyword, Brasil, 60 dias
+
+    Retorna a primeira lista nao-vazia ou [] se todos os niveis falharem.
     """
     try:
-        from jobspy import scrape_jobs
-
-        search_term = f"{cargo} {keywords}".strip()
-        location    = cidade if cidade else "Brazil"
-        logger.info(f"[JobSpy] Buscando '{search_term}' em '{location}'")
-
-        df = scrape_jobs(
-            site_name=["linkedin"],
-            search_term=search_term,
-            location=location,
-            results_wanted=quantidade,
-            hours_old=72,
-            country_indeed="Brazil",
-        )
-
-        if df is None or df.empty:
-            logger.warning("[JobSpy] Nenhuma vaga encontrada.")
-            return []
-
-        vagas = []
-        for _, row in df.iterrows():
-            vagas.append({
-                "title":       str(row.get("title", "")),
-                "company":     str(row.get("company", "")),
-                "location":    str(row.get("location", "")),
-                "description": str(row.get("description", ""))[:2000],
-                "job_url":     str(row.get("job_url", "")),
-            })
-
-        logger.info(f"[JobSpy] {len(vagas)} vagas encontradas.")
-        return vagas
-
+        from jobspy import scrape_jobs  # noqa: F401 — valida instalacao
     except ImportError:
-        logger.error("[JobSpy] python-jobspy nao instalado.")
+        logger.error("[JobSpy] python-jobspy nao instalado. Execute: pip install python-jobspy")
         return []
-    except Exception as e:
-        logger.error(f"[JobSpy] Erro: {e}", exc_info=True)
-        return []
+
+    location = _normalizar_location(cidade)
+
+    # Cargo limitado a 3 palavras — termos longos retornam zero resultados
+    cargo_curto = " ".join(cargo.split()[:3]) if cargo.strip() else ""
+
+    # Primeira keyword mais relevante — evita queries com 5+ termos
+    kw_principal = keywords.split()[0] if keywords.strip() else ""
+
+    termo_completo = f"{cargo_curto} {kw_principal}".strip()
+
+    estrategias = [
+        # (sites,                              termo,          local,    hours_old)
+        (["linkedin"],                          termo_completo, location,  168),   # Nivel 1: 7 dias
+        (["linkedin", "indeed"],                cargo_curto,    location,  720),   # Nivel 2: 30 dias cidade
+        (["linkedin", "indeed"],                cargo_curto,    "Brazil",  720),   # Nivel 3: 30 dias Brasil
+        (["linkedin", "indeed", "glassdoor"],   kw_principal or cargo_curto, "Brazil", 1440),  # Nivel 4: 60 dias
+    ]
+
+    for sites, termo, loc, hours in estrategias:
+        if not termo.strip():
+            continue
+        try:
+            vagas = _scrape_jobspy(sites, termo, loc, quantidade, hours)
+            if vagas:
+                logger.info(
+                    f"[JobSpy] Sucesso | sites={sites} | termo='{termo}' | loc='{loc}'"
+                )
+                return vagas
+            time.sleep(2)  # pausa entre tentativas para evitar rate-limit
+        except Exception as e:
+            logger.warning(
+                f"[JobSpy] Estrategia falhou (sites={sites}, termo='{termo}'): {e}"
+            )
+            time.sleep(3)
+
+    logger.warning("[JobSpy] Todas as estrategias falharam. Nenhuma vaga retornada.")
+    return []
