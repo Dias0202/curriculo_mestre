@@ -179,10 +179,10 @@ class CurriculoHarvard(FPDF):
     def bloco_competencias(self, titulo: str, lista: list):
         if not lista: return
         self._secao(titulo)
-        # Linha horizontal de keywords separadas por bullet
+        # Separador "|" — latin-1 seguro (bullet \u2022 nao e suportado pelo helvetica)
         itens = [sanitize(str(i)) for i in lista if i]
         self.set_font("helvetica", "", 10)
-        self.multi_cell(0, 5, "  •  ".join(itens), new_x="LMARGIN", new_y="NEXT")
+        self.multi_cell(0, 5, "  |  ".join(itens), new_x="LMARGIN", new_y="NEXT")
 
     def bloco_experiencias(self, titulo: str, exps: list):
         if not exps: return
@@ -503,6 +503,25 @@ def extrair_keywords_para_busca(perfil: dict) -> dict:
         return {"cargo": "Analista", "keywords": "", "area": ""}
 
 
+def perfil_tem_ingles_fluente(perfil: dict) -> bool:
+    """
+    Retorna True se o perfil indicar ingles em nivel Intermediario ou superior.
+    Verifica o campo 'languages' do perfil estruturado (Prompt 1).
+    """
+    niveis_ok = {"intermediario", "fluente", "nativo", "avancado",
+                 "intermediate", "fluent", "native", "advanced", "proficient"}
+    for lang in perfil.get("languages", []):
+        if not isinstance(lang, dict):
+            continue
+        idioma = lang.get("idioma", "").lower()
+        nivel  = lang.get("nivel",  "").lower()
+        if "ingl" in idioma or "english" in idioma:
+            if any(n in nivel for n in niveis_ok):
+                logger.info(f"[Remoto] Ingles detectado: nivel='{nivel}'")
+                return True
+    return False
+
+
 def selecionar_melhores_vagas(perfil: dict, vagas: list) -> list:
     """LLM seleciona as 2 vagas com maior aderencia ao perfil."""
     lista = "\n".join([
@@ -668,8 +687,14 @@ async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
         if not telegram_id or not perfil: continue
 
         try:
-            kw    = extrair_keywords_para_busca(perfil)
-            vagas = buscar_vagas_jobspy(kw.get("cargo",""), kw.get("keywords",""), cidade, 10)
+            kw              = extrair_keywords_para_busca(perfil)
+            ingles_fluente  = perfil_tem_ingles_fluente(perfil)
+            vagas = buscar_vagas_jobspy(
+                kw.get("cargo", ""), kw.get("keywords", ""), cidade,
+                quantidade=10,
+                buscar_remoto=True,
+                ingles_fluente=ingles_fluente,
+            )
 
             if not vagas:
                 await context.bot.send_message(
@@ -733,11 +758,23 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("Buscando vagas para o seu perfil no LinkedIn... Aguarde.")
+    cidade          = usuario.get("cidade", "Brazil")
+    kw              = extrair_keywords_para_busca(perfil)
+    ingles_fluente  = perfil_tem_ingles_fluente(perfil)
 
-    cidade = usuario.get("cidade", "Brazil")
-    kw     = extrair_keywords_para_busca(perfil)
-    vagas  = buscar_vagas_jobspy(kw.get("cargo",""), kw.get("keywords",""), cidade, 10)
+    msg_busca = "Buscando vagas locais"
+    if ingles_fluente:
+        msg_busca += " + remotas (PT e EN)"
+    else:
+        msg_busca += " + remotas"
+    await update.message.reply_text(f"{msg_busca}... Aguarde.")
+
+    vagas = buscar_vagas_jobspy(
+        kw.get("cargo", ""), kw.get("keywords", ""), cidade,
+        quantidade=10,
+        buscar_remoto=True,
+        ingles_fluente=ingles_fluente,
+    )
 
     if not vagas:
         await update.message.reply_text("Nenhuma vaga encontrada agora. Tente novamente mais tarde.")
