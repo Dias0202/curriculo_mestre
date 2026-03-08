@@ -667,42 +667,89 @@ def perfil_tem_ingles_fluente(perfil: dict) -> bool:
     return False
 
 
+_SCORE_LIMIAR = 60  # vagas abaixo deste score nao sao enviadas
+
+
 def selecionar_melhores_vagas(perfil: dict, vagas: list) -> list:
     """
-    LLM pontua cada vaga contra o perfil (0-100) e retorna apenas as com score >= 60,
-    ordenadas pela pontuacao, limitado a 2.
-    Usa uma unica chamada LLM para pontuar todas as vagas de uma vez.
+    LLM pontua cada vaga de 0 a 100 contra o perfil.
+    Retorna apenas vagas com score >= 60, ordenadas, maximo 2.
+
+    Normaliza automaticamente se o LLM retornar escala 0-1 (ex: 0.8 -> 80).
+    Se nenhuma vaga passar o limiar, retorna lista vazia (sem fallback silencioso).
     """
     lista = "\n".join([
-        f"{i}. {v.get('title','')} - {v.get('company','')} ({v.get('location','')}): "
-        f"{str(v.get('description',''))[:300]}"
+        f"{i}. {v.get('title','')} | {v.get('company','')} | {v.get('location','')}\n"
+        f"   Descricao: {str(v.get('description',''))[:400]}"
         for i, v in enumerate(vagas)
     ])
+
     raw = _chat(
-        system="Voce e um recrutador tecnico. Retorne SOMENTE JSON valido.",
+        system="Voce e um recrutador tecnico senior. Retorne SOMENTE JSON valido.",
         prompt=(
-            "Pontue cada vaga de 0 a 100 conforme a aderencia ao perfil do candidato.\n"
-            "Considere: cargo, tecnologias, nivel de senioridade e area de atuacao.\n"
-            'Retorne APENAS: {"scores": [{"indice": 0, "score": 75}, ...]}\n\n'
-            f"PERFIL:\n{json.dumps(perfil, ensure_ascii=False)[:2000]}\n\n"
-            f"VAGAS:\n{lista}"
+            "Avalie a aderencia de cada vaga ao perfil do candidato.\n\n"
+            "REGRAS DE PONTUACAO (escala INTEIRA de 0 a 100):\n"
+            "- 80-100: cargo, tecnologias E senioridade totalmente alinhados\n"
+            "- 60-79:  cargo e area alinhados, pequenos gaps de tecnologia\n"
+            "- 40-59:  area relacionada mas tecnologias ou senioridade divergem\n"
+            "- 0-39:   area ou cargo completamente diferente do perfil\n\n"
+            "IMPORTANTE: use numeros INTEIROS de 0 a 100. Nao use decimais como 0.8.\n"
+            "Se a vaga exige habilidades que o candidato claramente nao tem, pontue baixo.\n\n"
+            'Retorne APENAS este JSON (sem texto adicional):\n'
+            '{"scores": [{"indice": 0, "score": 75, "motivo": "breve justificativa"}, ...]}\n\n'
+            f"PERFIL DO CANDIDATO:\n{json.dumps(perfil, ensure_ascii=False)[:2500]}\n\n"
+            f"VAGAS PARA AVALIAR:\n{lista}"
         ),
         json_mode=True,
         temperature=0.0,
     )
+
     try:
         scores = _parse_json(raw).get("scores", [])
-        # Filtra score >= 60 e ordena decrescente
+
+        if not scores:
+            logger.warning("[Score] LLM retornou lista de scores vazia.")
+            return []
+
+        # Normaliza escala: se todos os scores estao entre 0-1, multiplica por 100
+        valores = [s.get("score", 0) for s in scores if isinstance(s, dict)]
+        if valores and max(valores) <= 1.0:
+            logger.info("[Score] Escala 0-1 detectada — normalizando para 0-100.")
+            for s in scores:
+                if isinstance(s, dict):
+                    s["score"] = round(s.get("score", 0) * 100)
+
+        # Log de todos os scores para debug
+        for s in scores:
+            idx = s.get("indice", "?")
+            sc  = s.get("score", 0)
+            mot = s.get("motivo", "")
+            titulo = vagas[idx].get("title", "?") if isinstance(idx, int) and idx < len(vagas) else "?"
+            logger.info(f"[Score] idx={idx} | score={sc} | vaga='{titulo}' | {mot}")
+
         aprovadas = sorted(
-            [s for s in scores if isinstance(s, dict) and s.get("score", 0) >= 60],
+            [s for s in scores if isinstance(s, dict) and s.get("score", 0) >= _SCORE_LIMIAR],
             key=lambda s: s.get("score", 0),
             reverse=True,
         )
-        logger.info(f"[Score] {len(aprovadas)}/{len(vagas)} vagas com score >= 60")
-        return [vagas[s["indice"]] for s in aprovadas[:2] if s["indice"] < len(vagas)]
+
+        logger.info(f"[Score] {len(aprovadas)}/{len(vagas)} vagas aprovadas (limiar={_SCORE_LIMIAR})")
+
+        resultado = [vagas[s["indice"]] for s in aprovadas[:2]
+                     if isinstance(s.get("indice"), int) and s["indice"] < len(vagas)]
+
+        # Adiciona o score como metadado na vaga para exibicao no relatorio
+        for s in aprovadas[:2]:
+            idx = s.get("indice")
+            if isinstance(idx, int) and idx < len(vagas):
+                vagas[idx]["_match_score"] = s.get("score", 0)
+
+        return resultado
+
     except Exception as e:
-        logger.warning(f"[Score] Falha ao pontuar vagas: {e} — usando primeiras 2")
-        return vagas[:2]
+        logger.error(f"[Score] Erro ao processar pontuacao: {e}", exc_info=True)
+        # Sem fallback — retorna vazio para nao enviar vagas nao avaliadas
+        return []
 
 
 def gerar_cv_json(perfil: dict, usuario: dict,
@@ -909,7 +956,11 @@ async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
             if not novas:
                 await context.bot.send_message(
                     chat_id=telegram_id,
-                    text="As melhores vagas de hoje ja foram enviadas anteriormente."
+                    text=(
+                        "Hoje nao encontrei vagas com match suficiente (>= 60%) para o seu perfil.\n"
+                        "As vagas disponiveis tinham baixa aderencia ao seu historico.\n"
+                        "Tente atualizar seu perfil com /meuperfil ou aguarde amanha."
+                    )
                 )
                 continue
 
@@ -984,7 +1035,14 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     novas    = [v for v in melhores if not job_ja_enviado(user_id, gerar_hash_vaga(v))]
 
     if not novas:
-        await update.message.reply_text("As melhores vagas de hoje ja foram enviadas. Tente amanha!")
+        motivo = (
+            "As vagas encontradas tiveram match abaixo de 60% com o seu perfil."
+            if melhores == [] else
+            "As vagas com bom match ja foram enviadas anteriormente."
+        )
+        await update.message.reply_text(
+            f"{motivo}\n\nDica: tente atualizar seu perfil com /meuperfil para melhorar os resultados."
+        )
         return
 
     await update.message.reply_text(f"Encontrei {len(novas)} vaga(s)! Gerando curriculos adaptados...")
