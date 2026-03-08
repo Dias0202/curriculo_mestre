@@ -21,11 +21,12 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from groq import Groq
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
@@ -667,16 +668,22 @@ def perfil_tem_ingles_fluente(perfil: dict) -> bool:
 
 
 def selecionar_melhores_vagas(perfil: dict, vagas: list) -> list:
-    """LLM seleciona as 2 vagas com maior aderencia ao perfil."""
+    """
+    LLM pontua cada vaga contra o perfil (0-100) e retorna apenas as com score >= 60,
+    ordenadas pela pontuacao, limitado a 2.
+    Usa uma unica chamada LLM para pontuar todas as vagas de uma vez.
+    """
     lista = "\n".join([
-        f"{i}. {v.get('title','')} - {v.get('company','')} ({v.get('location','')}): {str(v.get('description',''))[:300]}"
+        f"{i}. {v.get('title','')} - {v.get('company','')} ({v.get('location','')}): "
+        f"{str(v.get('description',''))[:300]}"
         for i, v in enumerate(vagas)
     ])
     raw = _chat(
         system="Voce e um recrutador tecnico. Retorne SOMENTE JSON valido.",
         prompt=(
-            'Selecione os 2 indices das vagas com MAIOR aderencia ao perfil do candidato.\n'
-            'Retorne APENAS: {"indices": [0, 1]}\n\n'
+            "Pontue cada vaga de 0 a 100 conforme a aderencia ao perfil do candidato.\n"
+            "Considere: cargo, tecnologias, nivel de senioridade e area de atuacao.\n"
+            'Retorne APENAS: {"scores": [{"indice": 0, "score": 75}, ...]}\n\n'
             f"PERFIL:\n{json.dumps(perfil, ensure_ascii=False)[:2000]}\n\n"
             f"VAGAS:\n{lista}"
         ),
@@ -684,17 +691,30 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list) -> list:
         temperature=0.0,
     )
     try:
-        indices = _parse_json(raw).get("indices", [0, 1])
-        return [vagas[i] for i in indices if i < len(vagas)][:2]
-    except Exception:
+        scores = _parse_json(raw).get("scores", [])
+        # Filtra score >= 60 e ordena decrescente
+        aprovadas = sorted(
+            [s for s in scores if isinstance(s, dict) and s.get("score", 0) >= 60],
+            key=lambda s: s.get("score", 0),
+            reverse=True,
+        )
+        logger.info(f"[Score] {len(aprovadas)}/{len(vagas)} vagas com score >= 60")
+        return [vagas[s["indice"]] for s in aprovadas[:2] if s["indice"] < len(vagas)]
+    except Exception as e:
+        logger.warning(f"[Score] Falha ao pontuar vagas: {e} — usando primeiras 2")
         return vagas[:2]
 
 
 def gerar_cv_json(perfil: dict, usuario: dict,
                   titulo_vaga: str, empresa_vaga: str,
-                  local_vaga: str, descricao_vaga: str) -> dict:
+                  local_vaga: str, descricao_vaga: str,
+                  com_resumo: bool = True) -> dict:
     """Prompt 2: gera o JSON completo do curriculo ATS."""
     idioma = usuario.get("idioma", "Portugues")
+    instrucao_resumo = (
+        "" if com_resumo
+        else "\nIMPORTANTE: NAO inclua a secao 'resumo' — deixe o campo 'resumo' como string vazia."
+    )
     raw = _chat(
         system=_SYSTEM_CV,
         prompt=(
@@ -705,15 +725,38 @@ def gerar_cv_json(perfil: dict, usuario: dict,
             f"Telefone: {usuario.get('telefone','')}\n"
             f"LinkedIn: {usuario.get('linkedin','')}\n"
             f"Cidade: {usuario.get('cidade','')}\n\n"
-            f"VAGA ALVO (Extraida via Scraper):\n"
+            f"VAGA ALVO:\n"
             f"Titulo: {titulo_vaga}\n"
             f"Empresa: {empresa_vaga}\n"
             f"Local: {local_vaga}\n"
             f"Descricao:\n{descricao_vaga}\n\n"
             f"IDIOMA DO CURRICULO: {idioma}"
+            f"{instrucao_resumo}"
         ),
         json_mode=True,
         temperature=0.15,
+    )
+    return _parse_json(raw)
+
+
+def editar_cv_json(cv_atual: dict, instrucao: str) -> dict:
+    """
+    Aplica uma edicao pontual no JSON do curriculo ja gerado.
+    Ex: 'Mude meu titulo para Senior Data Scientist' ou 'Remova o projeto X'.
+    """
+    raw = _chat(
+        system=(
+            "Voce e um especialista em curriculos ATS. "
+            "Aplique APENAS a alteracao solicitada no JSON do curriculo. "
+            "Mantenha todos os outros campos intactos. "
+            "Retorne SOMENTE o JSON completo atualizado, sem markdown."
+        ),
+        prompt=(
+            f"CURRICULO ATUAL (JSON):\n{json.dumps(cv_atual, ensure_ascii=False)}\n\n"
+            f"INSTRUCAO DE EDICAO:\n{instrucao}"
+        ),
+        json_mode=True,
+        temperature=0.0,
     )
     return _parse_json(raw)
 
@@ -779,17 +822,29 @@ def gerar_hash_vaga(vaga: dict) -> str:
 async def processar_e_enviar_vaga(
     bot, telegram_id: str, usuario: dict, perfil: dict,
     titulo: str, empresa: str, local: str, descricao: str,
-    url: str = "", job_hash: str = "", indice: int = 1
+    url: str = "", job_hash: str = "", indice: int = 1,
+    com_resumo: bool = True, context: ContextTypes.DEFAULT_TYPE = None,
 ):
-    cv      = gerar_cv_json(perfil, usuario, titulo, empresa, local, descricao)
+    cv      = gerar_cv_json(perfil, usuario, titulo, empresa, local, descricao, com_resumo)
     pdf_buf = gerar_pdf(cv)
 
-    nome         = cv.get("identificacao", {}).get("nome", usuario.get("nome_completo", "Candidato"))
-    nome_arquivo = f"CV_{nome.replace(' ','_')}_{empresa.replace(' ','_')}.pdf"
+    # Armazena ultimo CV gerado no contexto para permitir edicao posterior
+    if context is not None:
+        context.user_data["ultimo_cv"]      = cv
+        context.user_data["ultimo_usuario"] = usuario
+
+    # Nome do arquivo: NomeUsuario_NomeVaga.pdf
+    nome_usuario = usuario.get("nome_completo", "Candidato")
+    nome_vaga    = titulo or empresa or "Vaga"
+    # Remove caracteres invalidos para nome de arquivo
+    def _slug(s: str) -> str:
+        return re.sub(r"[^\w\-]", "_", s.strip())[:40]
+    nome_arquivo = f"{_slug(nome_usuario)}_{_slug(nome_vaga)}.pdf"
 
     caption = f"Vaga {indice}: {titulo}\nEmpresa: {empresa}\nLocal: {local}"
     if url and url not in ("nan", ""):
         caption += f"\nLink: {url}"
+    caption += "\nCom resumo: Sim" if com_resumo else "\nCom resumo: Nao"
 
     await bot.send_document(
         chat_id=telegram_id,
@@ -798,7 +853,7 @@ async def processar_e_enviar_vaga(
         caption=caption,
     )
 
-    # Relatorio analitico — enviado como mensagem separada
+    # Relatorio analitico
     rel = cv.get("relatorio_analitico", {})
     if rel:
         score = rel.get("match_score", "?")
@@ -810,6 +865,7 @@ async def processar_e_enviar_vaga(
             linhas += [f"- {g}" for g in gaps]
         if dica:
             linhas.append(f"\nDica para entrevista:\n{dica}")
+        linhas.append("\nPara editar o curriculo gerado, use /editar_cv + descricao da alteracao.")
         await bot.send_message(chat_id=telegram_id, text="\n".join(linhas))
 
     if job_hash:
@@ -1025,6 +1081,129 @@ async def ask_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     return ConversationHandler.END
 
+
+# =========================================================
+# HELPER — PERGUNTA O TIPO DE CV (inline keyboard)
+# =========================================================
+async def _perguntar_tipo_cv(update_or_query, context: ContextTypes.DEFAULT_TYPE,
+                              vaga_dados: dict):
+    """
+    Salva os dados da vaga em context.user_data e exibe o teclado
+    'Com Resumo' / 'Sem Resumo'. Funciona tanto para Update quanto para CallbackQuery.
+    """
+    context.user_data["vaga_pendente"] = vaga_dados
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Com Resumo",  callback_data="cv_com_resumo"),
+            InlineKeyboardButton("⚡ Sem Resumo", callback_data="cv_sem_resumo"),
+        ]
+    ])
+    msg = "Como voce quer o curriculo gerado?"
+    if hasattr(update_or_query, "message") and update_or_query.message:
+        await update_or_query.message.reply_text(msg, reply_markup=keyboard)
+    else:
+        await update_or_query.reply_text(msg, reply_markup=keyboard)
+
+
+async def callback_tipo_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processa o clique em 'Com Resumo' ou 'Sem Resumo'."""
+    query = update.callback_query
+    await query.answer()
+
+    com_resumo = query.data == "cv_com_resumo"
+    vaga       = context.user_data.pop("vaga_pendente", None)
+
+    if not vaga:
+        await query.edit_message_text("Sessao expirada. Envie a vaga novamente.")
+        return
+
+    user_id = str(update.effective_user.id)
+    usuario = buscar_usuario(user_id)
+    perfil  = (usuario or {}).get("perfil_estruturado") or {}
+
+    tipo_txt = "com resumo" if com_resumo else "sem resumo"
+    await query.edit_message_text(f"Gerando curriculo ATS {tipo_txt}... Aguarde.")
+
+    try:
+        await processar_e_enviar_vaga(
+            bot=context.bot,
+            telegram_id=user_id,
+            usuario=usuario,
+            perfil=perfil,
+            titulo=vaga.get("titulo", vaga.get("title", "")),
+            empresa=vaga.get("empresa", vaga.get("company", "")),
+            local=vaga.get("localizacao", vaga.get("location", "")),
+            descricao=vaga.get("descricao", vaga.get("description", "")),
+            url=vaga.get("url", vaga.get("job_url", "")),
+            com_resumo=com_resumo,
+            context=context,
+        )
+        await query.delete_message()
+    except Exception as e:
+        logger.error(f"[TipoCV] {e}", exc_info=True)
+        await query.edit_message_text(f"Erro ao gerar curriculo: {e}")
+
+
+# =========================================================
+# COMANDO /editar_cv — edita o ultimo curriculo gerado
+# =========================================================
+async def cmd_editar_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Uso: /editar_cv Mude meu titulo para Senior Data Scientist
+         /editar_cv Remova o projeto X
+         /editar_cv Adicione SQL nas competencias
+    """
+    user_id = str(update.effective_user.id)
+    cv_atual = context.user_data.get("ultimo_cv")
+    usuario  = context.user_data.get("ultimo_usuario") or buscar_usuario(user_id)
+
+    if not cv_atual:
+        await update.message.reply_text(
+            "Nenhum curriculo gerado nesta sessao.\n"
+            "Envie uma vaga para gerar um curriculo primeiro."
+        )
+        return
+
+    # Instrucao vem apos o comando: /editar_cv <instrucao>
+    partes     = update.message.text.split(maxsplit=1)
+    instrucao  = partes[1].strip() if len(partes) > 1 else ""
+
+    if not instrucao:
+        await update.message.reply_text(
+            "Informe o que editar apos o comando.\n"
+            "Exemplos:\n"
+            "/editar_cv Mude meu titulo para Senior Data Scientist\n"
+            "/editar_cv Remova o projeto X\n"
+            "/editar_cv Adicione Spark nas competencias"
+        )
+        return
+
+    status = await update.message.reply_text("Aplicando edicao no curriculo... Aguarde.")
+    try:
+        cv_novo  = editar_cv_json(cv_atual, instrucao)
+        pdf_buf  = gerar_pdf(cv_novo)
+
+        # Atualiza CV armazenado
+        context.user_data["ultimo_cv"] = cv_novo
+
+        nome_usuario = (usuario or {}).get("nome_completo", "Candidato")
+        titulo_cv    = cv_novo.get("identificacao", {}).get("titulo", "Curriculo")
+        def _slug(s: str) -> str:
+            return re.sub(r"[^\w\-]", "_", s.strip())[:40]
+        nome_arquivo = f"{_slug(nome_usuario)}_{_slug(titulo_cv)}_editado.pdf"
+
+        await context.bot.send_document(
+            chat_id=user_id,
+            document=pdf_buf,
+            filename=nome_arquivo,
+            caption=f"Curriculo atualizado: {instrucao}",
+        )
+        await status.delete()
+    except Exception as e:
+        logger.error(f"[EditarCV] {e}", exc_info=True)
+        await status.edit_text(f"Erro ao aplicar edicao: {e}")
+
+
 # =========================================================
 # HANDLER PRINCIPAL — TEXTO, ARQUIVO E URL LINKEDIN
 # =========================================================
@@ -1041,11 +1220,9 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.document:
             doc  = update.message.document
             file = await context.bot.get_file(doc.file_id)
-            buf  = bytearray()
-            await file.download_as_bytearray(out=buf)
-            texto = extrair_texto_arquivo(buf, doc.file_name)
+            buf  = await file.download_as_bytearray()          # API atual: retorna bytearray
+            texto = extrair_texto_arquivo(bytearray(buf), doc.file_name)
             logger.info(f"[Input] Arquivo '{doc.file_name}' de user={user_id}")
-            # Arquivos sao sempre historico ou vaga — pula classificacao OUTRO/EDICAO
             eh_arquivo = True
         else:
             texto = update.message.text.strip()
@@ -1148,24 +1325,8 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         vaga_dados = resultado["dados"]
-        await status.edit_text("Gerando curriculo ATS otimizado para a vaga...")
-        try:
-            await processar_e_enviar_vaga(
-                bot=context.bot,
-                telegram_id=str(user_id),
-                usuario=usuario,
-                perfil=perfil,
-                titulo=vaga_dados.get("titulo",""),
-                empresa=vaga_dados.get("empresa",""),
-                local=vaga_dados.get("localizacao",""),
-                descricao=vaga_dados.get("descricao",""),
-                url=vaga_dados.get("url",""),
-                indice=1,
-            )
-            await status.delete()
-        except Exception as e:
-            logger.error(f"[URL LinkedIn] {e}", exc_info=True)
-            await status.edit_text("Erro ao gerar curriculo. Tente novamente.")
+        await status.delete()
+        await _perguntar_tipo_cv(update, context, vaga_dados)
         return
 
     # ============================
@@ -1178,26 +1339,10 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await status.edit_text("Gerando curriculo ATS otimizado para a vaga...")
-    try:
-        await processar_e_enviar_vaga(
-            bot=context.bot,
-            telegram_id=str(user_id),
-            usuario=usuario,
-            perfil=perfil,
-            titulo="",
-            empresa="",
-            local="",
-            descricao=texto,
-            indice=1,
-        )
-        await status.delete()
-    except json.JSONDecodeError as e:
-        logger.error(f"[Vaga] JSON invalido: {e}")
-        await status.edit_text("O modelo gerou um documento invalido. Tente novamente.")
-    except Exception as e:
-        logger.error(f"[Vaga] {e}", exc_info=True)
-        await status.edit_text("Erro ao gerar curriculo. Tente novamente.")
+    await status.delete()
+    await _perguntar_tipo_cv(update, context, {
+        "titulo": "", "empresa": "", "localizacao": "", "descricao": texto, "url": "",
+    })
 
 
 async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1214,6 +1359,7 @@ async def _enviar_menu(update: Update, nome: str = ""):
         "📋 <b>Comandos disponíveis:</b>\n"
         "/meuperfil — Visualize e edite o histórico salvo\n"
         "/testar_vagas — Busca vagas agora e gera currículos\n"
+        "/editar_cv [instrucao] — Edita o último currículo gerado\n"
         "/deletar — Remova todos os seus dados\n\n"
         "Para <b>atualizar o perfil</b>, envie currículo (.pdf/.txt) ou texto livre.\n"
         "Para <b>gerar currículo ATS</b>, envie a descrição ou link de uma vaga.",
@@ -1307,6 +1453,8 @@ def main():
     app.add_handler(CommandHandler("testar_vagas", cmd_testar_vagas))
     app.add_handler(CommandHandler("meuperfil",    cmd_meu_perfil))
     app.add_handler(CommandHandler("deletar",      cmd_deletar))
+    app.add_handler(CommandHandler("editar_cv",    cmd_editar_cv))
+    app.add_handler(CallbackQueryHandler(callback_tipo_cv, pattern="^cv_(com|sem)_resumo$"))
     app.add_handler(
         MessageHandler(filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), handle_input)
     )
