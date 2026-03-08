@@ -1,214 +1,54 @@
-Adicionar o cache persistente
-🧱 1️⃣ TABELA: users
-📌 Nome no projeto:
+# ATS Resume Bot
 
-users
+Sistema assincrono de orquestracao de carreira focado em ATS (Applicant Tracking Systems). Este bot do Telegram atua como um pipeline de dados automatizado que ingere historicos profissionais, raspa vagas em tempo real via LinkedIn Guest API, realiza o match inteligente via LLM e gera curriculos otimizados em PDF.
 
-📌 O que armazena:
+## Arquitetura
 
-Perfil base do usuário (dados fixos)
+O sistema opera sob uma arquitetura serverless/micro-containers e utiliza processamento assincrono para lidar com I/O de rede intensivo.
 
-SQL:
-create table users (
-    id uuid primary key default gen_random_uuid(),
-    telegram_id text unique not null,
-    nome text,
-    email text,
-    telefone text,
-    linkedin text,
-    github text,
-    portfolio text,
-    idioma_preferencial text default 'Portugues',
-    created_at timestamptz default now(),
-    updated_at timestamptz default now()
-);
-🧾 2️⃣ TABELA: raw_inputs
-📌 Nome:
+* **Linguagem:** Python 3.11
+* **Orquestracao / UI:** `python-telegram-bot` (Modo Polling Assincrono)
+* **Motor LLM:** API Groq (`llama-3.3-70b-versatile`) focada em processamento rapido e saidas JSON estruturadas.
+* **Persistencia:** Supabase (PostgreSQL), utilizado puramente como Document Store (JSONB) para os perfis estruturados e controle transacional de vagas ja enviadas.
+* **Geracao de PDF:** `fpdf2` com customizacao estrutural para layout padrao Harvard.
+* **Web Scraping:** `jobspy` para abstracao de crawling da Guest API do LinkedIn.
+* **Hospedagem:** Preparado para Render.com (inclui servidor HTTP keep-alive na porta 10000).
 
-raw_inputs
+## Funcionalidades Core
 
-📌 O que armazena:
+1.  **Ingestao Dinamica de Perfil:**
+    * Faz o parsing de PDFs (`pypdf`) ou textos brutos enviados pelo usuario.
+    * O LLM (Prompt 1) atua como Engenheiro de Dados, normalizando datas, separando hard/soft skills e estruturando freelances e projetos academicos em um schema JSON rigoroso.
+2.  **Match de Vagas (Scraping + Scoring):**
+    * Job diario via APScheduler (executado as 12:00 BRT).
+    * Extrai termos-chave amplos do JSON do usuario.
+    * Aciona o `scraper.py` (JobSpy) para buscar vagas recentes.
+    * O LLM pontua as vagas (0 a 100). Apenas vagas >= 60 avancam no pipeline.
+3.  **Geracao de Curriculo (ATS SEO):**
+    * Injeta palavras-chave exatas da descricao da vaga nas secoes de competencias e resumo.
+    * Aplica o metodo STAR (Situation, Task, Action, Result) nos bullet points de experiencia.
+    * **ATS Stealth / White Fonting:** Emprega estampa de texto invisivel (RGB 255,255,255 tamanho 1) contendo hard skills exigidas pela vaga que o candidato nao possui experiencia formal comprovada, garantindo pontuacao em parsers ATS rudimentares sem corromper a leitura humana.
+4.  **Anti-Spam de Vagas:**
+    * Hash MD5 (Titulo + Empresa) e cruzado de forma relacional na tabela `sent_jobs` no Supabase para garantir idempotencia no envio diario.
 
-Tudo que o usuário já enviou (PDF, Word, texto livre, wizard)
+## Dependencias
 
-Permite:
+Consulte o `requirements.txt`. As bibliotecas principais incluem:
+* `python-telegram-bot[job-queue]>=21.0.1`
+* `groq>=0.9.0`
+* `supabase>=2.11.0`
+* `fpdf2>=2.7.9`
+* `pypdf>=5.0.0`
+* `python-jobspy>=1.1.80`
 
-Reprocessamento futuro
+## Configuracao e Deploy
 
-Auditoria
+### Variaveis de Ambiente (.env ou Dashboard)
+O sistema exige as seguintes variaveis de ambiente na infraestrutura para instanciacao:
 
-Melhorar parsing
-
-SQL:
-create table raw_inputs (
-    id uuid primary key default gen_random_uuid(),
-    user_id uuid references users(id) on delete cascade,
-    tipo text check (tipo in ('pdf', 'word', 'texto', 'wizard')),
-    conteudo_texto text,
-    arquivo_url text,
-    processado boolean default false,
-    created_at timestamptz default now()
-);
-💼 3️⃣ TABELA: experiences
-📌 Nome:
-
-experiences
-
-📌 O que armazena:
-
-Experiências profissionais estruturadas
-
-SQL:
-create table experiences (
-    id uuid primary key default gen_random_uuid(),
-    user_id uuid references users(id) on delete cascade,
-    cargo text,
-    empresa text,
-    localizacao text,
-    data_inicio text,
-    data_fim text,
-    descricao_empresa text,
-    created_at timestamptz default now()
-);
-📝 4️⃣ TABELA: experience_bullets
-📌 Nome:
-
-experience_bullets
-
-📌 O que armazena:
-
-Responsabilidades e conquistas de cada experiência
-
-SQL:
-create table experience_bullets (
-    id uuid primary key default gen_random_uuid(),
-    experience_id uuid references experiences(id) on delete cascade,
-    tipo text check (tipo in ('responsabilidade', 'conquista')),
-    texto text,
-    ordem integer default 0
-);
-🎓 5️⃣ TABELA: education
-📌 Nome:
-
-education
-
-📌 O que armazena:
-
-Formação acadêmica
-
-SQL:
-create table education (
-    id uuid primary key default gen_random_uuid(),
-    user_id uuid references users(id) on delete cascade,
-    grau text,
-    instituicao text,
-    ano_inicio text,
-    ano_fim text,
-    created_at timestamptz default now()
-);
-🛠 6️⃣ TABELA: skills
-📌 Nome:
-
-skills
-
-📌 O que armazena:
-
-Competências técnicas e soft skills do usuário
-
-SQL:
-create table skills (
-    id uuid primary key default gen_random_uuid(),
-    user_id uuid references users(id) on delete cascade,
-    nome text,
-    categoria text,
-    nivel text
-);
-📜 7️⃣ TABELA: certifications
-📌 Nome:
-
-certifications
-
-📌 O que armazena:
-
-Certificações profissionais
-
-SQL:
-create table certifications (
-    id uuid primary key default gen_random_uuid(),
-    user_id uuid references users(id) on delete cascade,
-    nome text,
-    emissor text,
-    ano text
-);
-🚀 8️⃣ TABELA: projects
-📌 Nome:
-
-projects
-
-📌 O que armazena:
-
-Projetos relevantes (acadêmicos ou profissionais)
-
-SQL:
-create table projects (
-    id uuid primary key default gen_random_uuid(),
-    user_id uuid references users(id) on delete cascade,
-    nome text,
-    descricao text,
-    created_at timestamptz default now()
-);
-🌍 9️⃣ TABELA: languages
-📌 Nome:
-
-languages
-
-📌 O que armazena:
-
-Idiomas do usuário
-
-SQL:
-create table languages (
-    id uuid primary key default gen_random_uuid(),
-    user_id uuid references users(id) on delete cascade,
-    idioma text,
-    nivel text
-);
-🧠 🔟 TABELA: generated_resumes
-📌 Nome:
-
-generated_resumes
-
-📌 O que armazena:
-
-Currículos gerados para vagas específicas
-
-Permite:
-
-Versionamento
-
-Histórico
-
-Analytics
-
-Score de match
-
-SQL:
-create table generated_resumes (
-    id uuid primary key default gen_random_uuid(),
-    user_id uuid references users(id) on delete cascade,
-    vaga_texto text,
-    vaga_hash text,
-    idioma text,
-    json_gerado jsonb,
-    pdf_url text,
-    score_match numeric,
-    created_at timestamptz default now()
-);
-📊 ÍNDICES IMPORTANTES (Performance)
-
-Execute também:
-
-create index idx_users_telegram on users(telegram_id);
-create index idx_experiences_user on experiences(user_id);
-create index idx_skills_user on skills(user_id);
-create index idx_generated_resumes_user on generated_resumes(user_id);
+```env
+TELEGRAM_TOKEN=token_do_botfather
+GROQ_API_KEY=api_groq
+SUPABASE_URL=url_supabase
+SUPABASE_KEY=anon_key_supabase
+PORT=10000 #Health check do Render
