@@ -270,12 +270,34 @@ class CurriculoHarvard(FPDF):
                             new_x="LMARGIN", new_y="NEXT")
             self.ln(2)
 
+    def bloco_keywords_ocultas(self, keywords: list):
+        """
+        Injeta keywords ausentes do perfil em fonte tamanho 1, cor branca.
+        Invisiveis para humanos, mas lidas pelo parser de texto dos sistemas ATS.
+        Posicionadas apos o ultimo bloco visivel, dentro da margem do documento.
+        """
+        if not keywords:
+            return
+        termos = [sanitize(str(k)) for k in keywords if k]
+        if not termos:
+            return
+        # Salva estado de cor atual
+        self.set_text_color(255, 255, 255)   # branco = invisivel no fundo branco
+        self.set_font("helvetica", "", 1)    # fonte minuscula — nao ocupa espaco visual
+        self.multi_cell(
+            0, 1,
+            " ".join(termos),
+            new_x="LMARGIN", new_y="NEXT",
+        )
+        self.set_text_color(0, 0, 0)         # restaura preto
+
 
 def gerar_pdf(cv: dict) -> io.BytesIO:
     """
     Recebe o JSON gerado pelo Prompt 2 (Recrutador Senior) e compila o PDF Harvard.
     Campos usados: cabecalhos, identificacao, resumo, competencias,
-                   experiencias, educacao, certificacoes, projetos, idiomas.
+                   experiencias, educacao, certificacoes, projetos, idiomas,
+                   keywords_ocultas (texto branco — ATS stealth).
     'relatorio_analitico' e ignorado aqui (enviado como mensagem).
     """
     if not isinstance(cv, dict): cv = {}
@@ -290,6 +312,8 @@ def gerar_pdf(cv: dict) -> io.BytesIO:
     pdf.bloco_lista_simples(cab.get("certificacoes", "Certificacoes"), cv.get("certificacoes", []))
     pdf.bloco_projetos(cab.get("projetos", "Projetos"), cv.get("projetos", []))
     pdf.bloco_lista_simples(cab.get("idiomas", "Idiomas"), cv.get("idiomas", []))
+    # Keywords ocultas — injetadas apos o ultimo bloco visivel
+    pdf.bloco_keywords_ocultas(cv.get("keywords_ocultas", []))
 
     buf = io.BytesIO()
     pdf.output(buf)
@@ -371,7 +395,8 @@ REGRAS VITAIS E ALGORITMICAS:
 3. METODO STAR OTIMIZADO: Reescreva os bullet points de experiencias focando em impacto quantificavel (Situacao, Tarefa, Acao, Resultado). Inicie sempre com verbos de acao fortes.
 4. ALAVANCAGEM DE BACKGROUND (CRITICO): Valorize intensamente Projetos Pessoais, Academicos e trabalhos Freelance. Use-os estrategicamente para compensar eventuais faltas de experiencia formal.
 5. IDIOMA: Todo o conteudo gerado deve ser rigorosamente redigido no idioma especificado pelo campo IDIOMA.
-6. FORMATO STRICT JSON: Retorne apenas o JSON puro, sem formatacao markdown, sem explicacoes adicionais.
+6. KEYWORDS OCULTAS (ATS STEALTH): No campo "keywords_ocultas", liste TODOS os termos exigidos pela vaga que o candidato NAO possui experiencia comprovada. Esses termos serao inseridos no PDF em fonte branca (invisivel para humanos, mas lido pelo parser ATS). Liste apenas termos tecnicos, ferramentas e certificacoes — nao inclua frases completas.
+7. FORMATO STRICT JSON: Retorne apenas o JSON puro, sem formatacao markdown, sem explicacoes adicionais.
 
 SCHEMA OBRIGATORIO:
 {
@@ -425,6 +450,7 @@ SCHEMA OBRIGATORIO:
     }
   ],
   "idiomas": ["Idioma - Nivel"],
+  "keywords_ocultas": ["termo1", "termo2", "termo3"],
   "relatorio_analitico": {
     "match_score": 0,
     "analise_gaps": ["requisito da vaga que o candidato NAO possui"],
@@ -436,19 +462,37 @@ SCHEMA OBRIGATORIO:
 # FUNCOES LLM
 # =========================================================
 def classificar_intencao(texto: str) -> str:
-    """Retorna 'URL_LINKEDIN', 'VAGA' ou 'HISTORICO'."""
+    """
+    Retorna uma de cinco categorias:
+      URL_LINKEDIN — link de vaga do LinkedIn
+      VAGA         — descricao de cargo/emprego
+      HISTORICO    — curriculo ou historico profissional completo
+      EDICAO       — instrucao de edicao do perfil ('remova X', 'atualize meu telefone', etc.)
+      OUTRO        — mensagem nao relacionada ao bot (saudacoes, perguntas gerais, etc.)
+    """
     if re.search(r"linkedin\.com/jobs", texto, re.IGNORECASE):
         return "URL_LINKEDIN"
     raw = _chat(
-        system="Classifique textos profissionais. Responda APENAS com uma palavra: VAGA ou HISTORICO.",
+        system=(
+            "Voce classifica mensagens enviadas a um bot de curriculo profissional. "
+            "Responda APENAS com uma palavra: VAGA, HISTORICO, EDICAO ou OUTRO."
+        ),
         prompt=(
-            "VAGA = descricao de cargo/emprego de uma empresa.\n"
-            "HISTORICO = perfil/curriculo/historico profissional de uma pessoa.\n\n"
-            f"Texto:\n{texto[:1500]}"
+            "Categorias:\n"
+            "VAGA     = descricao de cargo/emprego publicada por uma empresa\n"
+            "HISTORICO = curriculo, perfil profissional ou listagem de experiencias de uma pessoa\n"
+            "EDICAO   = instrucao direta para editar o perfil salvo. "
+            "            Exemplos: 'remova a experiencia X', 'meu novo telefone e', "
+            "            'adicione o curso Y', 'atualize minha cidade para'\n"
+            "OUTRO    = qualquer outra coisa: saudacoes, perguntas gerais, textos sem relacao\n\n"
+            f"Mensagem:\n{texto[:1500]}"
         ),
         temperature=0.0,
     )
-    return "VAGA" if "VAGA" in raw.upper() else "HISTORICO"
+    for cat in ("VAGA", "HISTORICO", "EDICAO"):
+        if cat in raw.upper():
+            return cat
+    return "OUTRO"
 
 
 def consolidar_perfil(perfil_atual: dict, nova_entrada: str) -> dict:
@@ -463,6 +507,112 @@ def consolidar_perfil(perfil_atual: dict, nova_entrada: str) -> dict:
         temperature=0.0,
     )
     return _parse_json(raw)
+
+
+def editar_perfil_llm(perfil_atual: dict, instrucao: str) -> dict:
+    """
+    Aplica uma edicao pontual ao perfil estruturado com base em instrucao em texto livre.
+    Ex: 'Remova a experiencia na empresa X', 'Atualize meu telefone para 31999999999'.
+    Retorna o perfil atualizado no mesmo schema do Prompt 1.
+    """
+    raw = _chat(
+        system=(
+            _SYSTEM_CONSOLIDAR +
+            "\n\nMODO EDICAO PONTUAL: O usuario esta pedindo uma alteracao especifica. "
+            "Aplique APENAS a mudanca solicitada. Nao altere nenhum outro dado."
+        ),
+        prompt=(
+            f"PERFIL ATUAL:\n{json.dumps(perfil_atual, ensure_ascii=False)}\n\n"
+            f"INSTRUCAO DE EDICAO DO USUARIO:\n{instrucao}"
+        ),
+        json_mode=True,
+        temperature=0.0,
+    )
+    return _parse_json(raw)
+
+
+def formatar_perfil_texto(usuario: dict, perfil: dict) -> str:
+    """Formata o perfil estruturado em texto legivel para o Telegram."""
+    linhas = []
+    nome = usuario.get("nome_completo", "Candidato")
+    linhas.append(f"👤 *{nome}*")
+
+    email    = usuario.get("email", "")
+    telefone = usuario.get("telefone", "")
+    linkedin = usuario.get("linkedin", "")
+    cidade   = usuario.get("cidade", "")
+    idioma   = usuario.get("idioma", "")
+
+    contato = []
+    if email:    contato.append(f"📧 {email}")
+    if telefone: contato.append(f"📱 {telefone}")
+    if contato:  linhas.append("  |  ".join(contato))
+    if linkedin: linhas.append(f"🔗 {linkedin}")
+    if cidade:   linhas.append(f"📍 {cidade}")
+    if idioma:   linhas.append(f"🌐 Curriculo em: {idioma}")
+
+    # Experiencias
+    exps = perfil.get("experiences", [])
+    if exps:
+        linhas.append("\n💼 *EXPERIENCIAS*")
+        for e in exps:
+            cargo   = e.get("cargo", "")
+            empresa = e.get("empresa", "")
+            inicio  = e.get("data_inicio", "")
+            fim     = e.get("data_fim", "")
+            linhas.append(f"• {cargo} | {empresa}")
+            linhas.append(f"  {inicio} → {fim}")
+
+    # Educacao
+    edus = perfil.get("education", [])
+    if edus:
+        linhas.append("\n🎓 *FORMACAO*")
+        for ed in edus:
+            grau  = ed.get("grau", "")
+            curso = ed.get("curso", "")
+            inst  = ed.get("instituicao", "")
+            ini   = ed.get("ano_inicio", "")
+            fim   = ed.get("ano_fim", "")
+            linhas.append(f"• {grau} em {curso}" if grau else f"• {curso}")
+            linhas.append(f"  {inst} | {ini} – {fim}")
+
+    # Skills
+    skills = perfil.get("skills", [])
+    if skills:
+        hard = [s.get("nome","") for s in skills if "hard" in s.get("categoria","").lower()]
+        soft = [s.get("nome","") for s in skills if "soft" in s.get("categoria","").lower()]
+        linhas.append("\n🛠 *COMPETENCIAS*")
+        if hard: linhas.append("Hard: " + ", ".join(hard))
+        if soft: linhas.append("Soft: " + ", ".join(soft))
+
+    # Certificacoes
+    certs = perfil.get("certifications", [])
+    if certs:
+        linhas.append("\n📜 *CERTIFICACOES*")
+        for c in certs:
+            linhas.append(f"• {c.get('nome','')} – {c.get('emissor','')} ({c.get('ano','')})")
+
+    # Projetos
+    projs = perfil.get("projects", [])
+    if projs:
+        linhas.append("\n🚀 *PROJETOS*")
+        for p in projs:
+            desc = p.get("descricao", "")[:80]
+            linhas.append(f"• {p.get('nome','')}")
+            if desc: linhas.append(f"  {desc}...")
+
+    # Idiomas
+    langs = perfil.get("languages", [])
+    if langs:
+        linhas.append("\n🌍 *IDIOMAS*")
+        for l in langs:
+            linhas.append(f"• {l.get('idioma','')} – {l.get('nivel','')}")
+
+    linhas.append(
+        "\n_Para editar: descreva a alteracao em texto livre._\n"
+        "_Ex: \"Remova a experiencia na empresa X\" ou \"Atualize meu telefone para...\"_"
+    )
+    return "\n".join(linhas)
 
 
 def extrair_keywords_para_busca(perfil: dict) -> dict:
@@ -816,15 +966,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     usuario = buscar_usuario(user_id)
 
     if usuario and usuario.get("email"):
-        await update.message.reply_text(
-            "Perfil ativo!\n\n"
-            "O que voce pode fazer:\n"
-            "- Enviar .txt ou .pdf com seu historico para atualizar o perfil\n"
-            "- Colar a descricao de uma vaga (texto livre) para gerar o curriculo agora\n"
-            "- Colar um link do LinkedIn para gerar o curriculo para aquela vaga\n"
-            "- /testar_vagas para buscar vagas e receber curriculos agora\n\n"
-            "Todo dia ao meio-dia voce recebe 2 sugestoes automaticas com curriculo ja adaptado."
-        )
+        nome = usuario.get("nome_completo", update.effective_user.first_name or "")
+        await _enviar_menu(update, nome)
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -899,8 +1042,6 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use /start para configurar seu perfil primeiro.")
         return
 
-    status = await update.message.reply_text("Processando... Aguarde.")
-
     # --- Extrai texto ---
     try:
         if update.message.document:
@@ -910,21 +1051,61 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await file.download_as_bytearray(out=buf)
             texto = extrair_texto_arquivo(buf, doc.file_name)
             logger.info(f"[Input] Arquivo '{doc.file_name}' de user={user_id}")
+            # Arquivos sao sempre historico ou vaga — pula classificacao OUTRO/EDICAO
+            eh_arquivo = True
         else:
             texto = update.message.text.strip()
             logger.info(f"[Input] Texto de user={user_id}: {texto[:60]}")
+            eh_arquivo = False
     except Exception as e:
         logger.error(f"[Input] {e}")
-        await status.edit_text("Nao consegui ler o arquivo. Tente novamente.")
+        await update.message.reply_text("Nao consegui ler o arquivo. Tente novamente.")
         return
 
     if not texto.strip():
-        await status.edit_text("Nenhum conteudo detectado.")
+        await update.message.reply_text("Nenhum conteudo detectado.")
         return
 
     intencao = classificar_intencao(texto)
     logger.info(f"[Input] Intencao: {intencao} para user={user_id}")
     perfil = usuario.get("perfil_estruturado") or {}
+
+    # ============================
+    # OUTRO — mensagem nao reconhecida
+    # ============================
+    if intencao == "OUTRO" and not eh_arquivo:
+        nome = usuario.get("nome_completo", update.effective_user.first_name or "")
+        await update.message.reply_text(
+            f"Ola, {nome}! Nao reconheci uma vaga ou historico profissional. 🤔\n"
+            "Selecione uma das opcoes abaixo para continuar:"
+        )
+        await _enviar_menu(update)
+        return
+
+    # ============================
+    # EDICAO — edita perfil por texto
+    # ============================
+    if intencao == "EDICAO" and not eh_arquivo:
+        if not perfil:
+            await update.message.reply_text(
+                "Voce ainda nao tem historico salvo.\n"
+                "Envie primeiro um .pdf ou .txt com seu curriculo."
+            )
+            return
+        status = await update.message.reply_text("Aplicando edicao no seu perfil... Aguarde.")
+        try:
+            novo_perfil = editar_perfil_llm(perfil, texto)
+            atualizar_perfil_estruturado(user_id, novo_perfil)
+            await status.edit_text(
+                "Perfil atualizado! ✅\n\n"
+                "Use /meuperfil para conferir as alteracoes."
+            )
+        except Exception as e:
+            logger.error(f"[Edicao] {e}", exc_info=True)
+            await status.edit_text("Erro ao aplicar edicao. Tente novamente.")
+        return
+
+    status = await update.message.reply_text("Processando... Aguarde.")
 
     # ============================
     # HISTORICO — Consolida perfil
@@ -934,13 +1115,16 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             novo_perfil = consolidar_perfil(perfil, texto)
             atualizar_perfil_estruturado(user_id, novo_perfil)
+            nome = usuario.get("nome_completo", update.effective_user.first_name or "")
             await status.edit_text(
-                "Perfil atualizado com sucesso!\n\n"
+                "Perfil atualizado com sucesso! ✅\n\n"
                 "Agora voce pode:\n"
                 "- Colar a descricao de uma vaga para gerar o curriculo\n"
                 "- Colar um link do LinkedIn\n"
-                "- Usar /testar_vagas para buscar vagas agora\n"
-                "- Aguardar as sugestoes automaticas do meio-dia"
+                "- Usar /testar\\_vagas para buscar vagas agora\n"
+                "- Aguardar as sugestoes automaticas do meio-dia\n\n"
+                "Use /meuperfil para ver o historico salvo\\.",
+                parse_mode="MarkdownV2",
             )
         except Exception as e:
             logger.error(f"[Historico] {e}", exc_info=True)
@@ -1026,6 +1210,68 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"[Erro Global] {context.error}", exc_info=context.error)
 
+
+# =========================================================
+# MENU PADRAO — reutilizado em cmd_start, OUTRO, etc.
+# =========================================================
+async def _enviar_menu(update: Update, nome: str = ""):
+    saudacao = f"Ola, {nome}! " if nome else ""
+    await update.message.reply_text(
+        f"{saudacao}Perfil ativo. ✅\n\n"
+        "📋 *Comandos disponíveis:*\n"
+        "/meuperfil — Visualize e edite o historico salvo\n"
+        "/testar\\_vagas — Busca vagas agora e gera curriculos\n"
+        "/deletar — Remova todos os seus dados\n\n"
+        "Para *atualizar o perfil*, envie curriculo \\(.pdf/.txt\\) ou texto livre\\.\n"
+        "Para *gerar curriculo ATS*, envie a descricao ou link de uma vaga\\.",
+        parse_mode="MarkdownV2",
+    )
+
+
+# =========================================================
+# COMANDO /meuperfil
+# =========================================================
+async def cmd_meu_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    usuario = buscar_usuario(user_id)
+
+    if not usuario or not usuario.get("email"):
+        await update.message.reply_text("Use /start para configurar seu perfil primeiro.")
+        return
+
+    perfil = usuario.get("perfil_estruturado") or {}
+
+    if not perfil:
+        await update.message.reply_text(
+            "Voce ainda nao tem historico salvo.\n"
+            "Envie um arquivo .pdf ou .txt com seu curriculo para comecar."
+        )
+        return
+
+    texto = formatar_perfil_texto(usuario, perfil)
+    # Telegram tem limite de 4096 chars por mensagem
+    for i in range(0, len(texto), 4000):
+        await update.message.reply_text(
+            texto[i:i+4000],
+            parse_mode="Markdown",
+        )
+
+
+# =========================================================
+# COMANDO /deletar
+# =========================================================
+async def cmd_deletar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    try:
+        db_client.table("sent_jobs").delete().eq("telegram_id", user_id).execute()
+        db_client.table("user_profiles").delete().eq("telegram_id", user_id).execute()
+        await update.message.reply_text(
+            "Todos os seus dados foram removidos. Use /start para comecar novamente."
+        )
+    except Exception as e:
+        logger.error(f"[Deletar] {e}", exc_info=True)
+        await update.message.reply_text("Erro ao remover dados. Tente novamente.")
+
 # =========================================================
 # MAIN
 # =========================================================
@@ -1068,6 +1314,8 @@ def main():
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("testar_vagas", cmd_testar_vagas))
+    app.add_handler(CommandHandler("meuperfil",    cmd_meu_perfil))
+    app.add_handler(CommandHandler("deletar",      cmd_deletar))
     app.add_handler(
         MessageHandler(filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), handle_input)
     )
