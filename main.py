@@ -466,21 +466,41 @@ def consolidar_perfil(perfil_atual: dict, nova_entrada: str) -> dict:
 
 
 def extrair_keywords_para_busca(perfil: dict) -> dict:
-    """Extrai cargo e keywords do perfil estruturado para o JobSpy."""
+    """
+    Extrai cargo e keywords do perfil estruturado para o JobSpy.
+
+    CRITICO: O campo 'cargo' deve ter NO MAXIMO 3 palavras simples e amplas,
+    prontas para serem usadas como query de busca em sites de emprego.
+    Termos longos ou especificos retornam zero resultados.
+    """
     raw = _chat(
-        system="Extrai informacoes de perfis profissionais. Retorne SOMENTE JSON valido.",
+        system="Voce extrai dados de perfis profissionais para busca de empregos. Retorne SOMENTE JSON valido.",
         prompt=(
-            'Analise o perfil e retorne:\n'
-            '{"cargo": "cargo mais recente", "keywords": "3-5 keywords tecnicas separadas por espaco", "area": "area em 2 palavras"}\n\n'
-            f"{json.dumps(perfil, ensure_ascii=False)[:3000]}"
+            "Analise o perfil abaixo e retorne um JSON com:\n"
+            '- "cargo": titulo do cargo mais recente reduzido a NO MAXIMO 3 palavras curtas e amplas, '
+            'como se fosse uma busca no LinkedIn. NUNCA use frases longas. '
+            'Exemplos corretos: "Desenvolvedor Python", "Analista de Dados", "Engenheiro ML", "Cientista de Dados". '
+            'Exemplos ERRADOS: "Desenvolvedor de Projetos Machine Learning IA Bioinformatica".\n'
+            '- "keywords": apenas 1 ou 2 ferramentas ou tecnologias principais separadas por espaco. '
+            'Exemplos: "Python SQL", "React Node", "AWS Terraform".\n'
+            '- "area": area de atuacao em 2 palavras. Exemplos: "Tecnologia Dados", "Engenharia Software".\n\n'
+            f"PERFIL:\n{json.dumps(perfil, ensure_ascii=False)[:3000]}"
         ),
         json_mode=True,
         temperature=0.0,
     )
     try:
-        return _parse_json(raw)
+        resultado = _parse_json(raw)
+        # Garante que o cargo nao ultrapasse 3 palavras mesmo se o LLM nao seguir a instrucao
+        cargo = resultado.get("cargo", "")
+        palavras = cargo.split()
+        if len(palavras) > 3:
+            resultado["cargo"] = " ".join(palavras[:3])
+            logger.warning(f"[Keywords] Cargo truncado de '{cargo}' para '{resultado['cargo']}'")
+        logger.info(f"[Keywords] cargo='{resultado.get('cargo')}' keywords='{resultado.get('keywords')}'")
+        return resultado
     except Exception:
-        return {"cargo": "", "keywords": "", "area": ""}
+        return {"cargo": "Analista", "keywords": "", "area": ""}
 
 
 def selecionar_melhores_vagas(perfil: dict, vagas: list) -> list:
