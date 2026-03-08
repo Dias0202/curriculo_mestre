@@ -532,10 +532,10 @@ def editar_perfil_llm(perfil_atual: dict, instrucao: str) -> dict:
 
 
 def formatar_perfil_texto(usuario: dict, perfil: dict) -> str:
-    """Formata o perfil estruturado em texto legivel para o Telegram."""
+    """Formata o perfil estruturado em texto legivel para o Telegram (sem parse_mode)."""
     linhas = []
     nome = usuario.get("nome_completo", "Candidato")
-    linhas.append(f"👤 *{nome}*")
+    linhas.append(f"👤 {nome}")
 
     email    = usuario.get("email", "")
     telefone = usuario.get("telefone", "")
@@ -551,22 +551,20 @@ def formatar_perfil_texto(usuario: dict, perfil: dict) -> str:
     if cidade:   linhas.append(f"📍 {cidade}")
     if idioma:   linhas.append(f"🌐 Curriculo em: {idioma}")
 
-    # Experiencias
     exps = perfil.get("experiences", [])
     if exps:
-        linhas.append("\n💼 *EXPERIENCIAS*")
+        linhas.append("\n💼 EXPERIENCIAS")
         for e in exps:
             cargo   = e.get("cargo", "")
             empresa = e.get("empresa", "")
             inicio  = e.get("data_inicio", "")
             fim     = e.get("data_fim", "")
             linhas.append(f"• {cargo} | {empresa}")
-            linhas.append(f"  {inicio} → {fim}")
+            linhas.append(f"  {inicio} -> {fim}")
 
-    # Educacao
     edus = perfil.get("education", [])
     if edus:
-        linhas.append("\n🎓 *FORMACAO*")
+        linhas.append("\n🎓 FORMACAO")
         for ed in edus:
             grau  = ed.get("grau", "")
             curso = ed.get("curso", "")
@@ -574,43 +572,39 @@ def formatar_perfil_texto(usuario: dict, perfil: dict) -> str:
             ini   = ed.get("ano_inicio", "")
             fim   = ed.get("ano_fim", "")
             linhas.append(f"• {grau} em {curso}" if grau else f"• {curso}")
-            linhas.append(f"  {inst} | {ini} – {fim}")
+            linhas.append(f"  {inst} | {ini} - {fim}")
 
-    # Skills
     skills = perfil.get("skills", [])
     if skills:
         hard = [s.get("nome","") for s in skills if "hard" in s.get("categoria","").lower()]
         soft = [s.get("nome","") for s in skills if "soft" in s.get("categoria","").lower()]
-        linhas.append("\n🛠 *COMPETENCIAS*")
+        linhas.append("\n🛠 COMPETENCIAS")
         if hard: linhas.append("Hard: " + ", ".join(hard))
         if soft: linhas.append("Soft: " + ", ".join(soft))
 
-    # Certificacoes
     certs = perfil.get("certifications", [])
     if certs:
-        linhas.append("\n📜 *CERTIFICACOES*")
+        linhas.append("\n📜 CERTIFICACOES")
         for c in certs:
-            linhas.append(f"• {c.get('nome','')} – {c.get('emissor','')} ({c.get('ano','')})")
+            linhas.append(f"• {c.get('nome','')} - {c.get('emissor','')} ({c.get('ano','')})")
 
-    # Projetos
     projs = perfil.get("projects", [])
     if projs:
-        linhas.append("\n🚀 *PROJETOS*")
+        linhas.append("\n🚀 PROJETOS")
         for p in projs:
             desc = p.get("descricao", "")[:80]
             linhas.append(f"• {p.get('nome','')}")
             if desc: linhas.append(f"  {desc}...")
 
-    # Idiomas
     langs = perfil.get("languages", [])
     if langs:
-        linhas.append("\n🌍 *IDIOMAS*")
+        linhas.append("\n🌍 IDIOMAS")
         for l in langs:
-            linhas.append(f"• {l.get('idioma','')} – {l.get('nivel','')}")
+            linhas.append(f"• {l.get('idioma','')} - {l.get('nivel','')}")
 
     linhas.append(
-        "\n_Para editar: descreva a alteracao em texto livre._\n"
-        "_Ex: \"Remova a experiencia na empresa X\" ou \"Atualize meu telefone para...\"_"
+        "\nPara editar: descreva a alteracao em texto livre.\n"
+        "Ex: \"Remova a experiencia na empresa X\" ou \"Atualize meu telefone para...\""
     )
     return "\n".join(linhas)
 
@@ -1121,10 +1115,9 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Agora voce pode:\n"
                 "- Colar a descricao de uma vaga para gerar o curriculo\n"
                 "- Colar um link do LinkedIn\n"
-                "- Usar /testar\\_vagas para buscar vagas agora\n"
+                "- Usar /testar_vagas para buscar vagas agora\n"
                 "- Aguardar as sugestoes automaticas do meio-dia\n\n"
-                "Use /meuperfil para ver o historico salvo\\.",
-                parse_mode="MarkdownV2",
+                "Use /meuperfil para ver o historico salvo."
             )
         except Exception as e:
             logger.error(f"[Historico] {e}", exc_info=True)
@@ -1215,16 +1208,16 @@ async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
 # MENU PADRAO — reutilizado em cmd_start, OUTRO, etc.
 # =========================================================
 async def _enviar_menu(update: Update, nome: str = ""):
-    saudacao = f"Ola, {nome}! " if nome else ""
+    saudacao = f"Olá, {nome}! " if nome else ""
     await update.message.reply_text(
         f"{saudacao}Perfil ativo. ✅\n\n"
-        "📋 *Comandos disponíveis:*\n"
-        "/meuperfil — Visualize e edite o historico salvo\n"
-        "/testar\\_vagas — Busca vagas agora e gera curriculos\n"
+        "📋 <b>Comandos disponíveis:</b>\n"
+        "/meuperfil — Visualize e edite o histórico salvo\n"
+        "/testar_vagas — Busca vagas agora e gera currículos\n"
         "/deletar — Remova todos os seus dados\n\n"
-        "Para *atualizar o perfil*, envie curriculo \\(.pdf/.txt\\) ou texto livre\\.\n"
-        "Para *gerar curriculo ATS*, envie a descricao ou link de uma vaga\\.",
-        parse_mode="MarkdownV2",
+        "Para <b>atualizar o perfil</b>, envie currículo (.pdf/.txt) ou texto livre.\n"
+        "Para <b>gerar currículo ATS</b>, envie a descrição ou link de uma vaga.",
+        parse_mode="HTML",
     )
 
 
@@ -1249,12 +1242,10 @@ async def cmd_meu_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     texto = formatar_perfil_texto(usuario, perfil)
-    # Telegram tem limite de 4096 chars por mensagem
+    # Telegram tem limite de 4096 chars por mensagem — envia em blocos sem parse_mode
+    # para evitar crash com caracteres especiais nos dados do usuario
     for i in range(0, len(texto), 4000):
-        await update.message.reply_text(
-            texto[i:i+4000],
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(texto[i:i+4000])
 
 
 # =========================================================
