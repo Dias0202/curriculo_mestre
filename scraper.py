@@ -171,57 +171,152 @@ def _scrape_jobspy(site_name: list, search_term: str, location: str,
     return vagas
 
 
-def buscar_vagas_jobspy(cargo: str, keywords: str, cidade: str, quantidade: int = 10) -> list:
+def _traduzir_cargo_en(cargo: str) -> str:
     """
-    Busca vagas com estrategia de fallback em 4 niveis:
+    Mapeamento rapido PT -> EN para os cargos mais comuns em TI.
+    Usado para buscar vagas remotas em ingles sem precisar chamar o LLM.
+    """
+    mapa = {
+        "desenvolvedor": "developer",
+        "engenheiro":    "engineer",
+        "analista":      "analyst",
+        "cientista":     "scientist",
+        "arquiteto":     "architect",
+        "gerente":       "manager",
+        "coordenador":   "coordinator",
+        "especialista":  "specialist",
+        "consultor":     "consultant",
+        "dados":         "data",
+        "software":      "software",
+        "sistemas":      "systems",
+        "infraestrutura":"infrastructure",
+        "seguranca":     "security",
+        "qualidade":     "quality",
+        "produto":       "product",
+        "ml":            "machine learning",
+        "ia":            "ai",
+        "backend":       "backend",
+        "frontend":      "frontend",
+        "fullstack":     "full stack",
+        "devops":        "devops",
+        "cloud":         "cloud",
+        "mobile":        "mobile",
+    }
+    resultado = cargo.lower()
+    for pt, en in mapa.items():
+        resultado = resultado.replace(pt, en)
+    return resultado.strip().title()
 
-    Nivel 1 — LinkedIn, cargo (ate 3 palavras) + 1a keyword, cidade, 7 dias
-    Nivel 2 — LinkedIn + Indeed, apenas cargo curto, cidade, 30 dias
-    Nivel 3 — LinkedIn + Indeed, apenas cargo curto, Brasil, 30 dias
-    Nivel 4 — LinkedIn + Indeed + Glassdoor, 1a keyword, Brasil, 60 dias
 
-    Retorna a primeira lista nao-vazia ou [] se todos os niveis falharem.
+def buscar_vagas_jobspy(
+    cargo: str,
+    keywords: str,
+    cidade: str,
+    quantidade: int = 10,
+    buscar_remoto: bool = False,
+    ingles_fluente: bool = False,
+) -> list:
+    """
+    Busca vagas locais com fallback em 4 niveis + busca remota opcional.
+
+    VAGAS LOCAIS (sempre executado):
+      Nivel 1 — LinkedIn, cargo + keyword, cidade, 7 dias
+      Nivel 2 — LinkedIn + Indeed, cargo, cidade, 30 dias
+      Nivel 3 — LinkedIn + Indeed, cargo, Brasil, 30 dias
+      Nivel 4 — LinkedIn + Indeed + Glassdoor, keyword, Brasil, 60 dias
+
+    VAGAS REMOTAS (se buscar_remoto=True):
+      Nivel R1 — LinkedIn, cargo + 'remoto', Brasil, 30 dias
+      Nivel R2 — LinkedIn + Indeed, cargo EN + 'remote', Worldwide, 30 dias  (se ingles_fluente=True)
+      Nivel R3 — LinkedIn, keyword + 'remote', Worldwide, 60 dias            (se ingles_fluente=True)
+
+    Retorna lista combinada (locais + remotas), sem duplicatas por titulo+empresa.
     """
     try:
-        from jobspy import scrape_jobs  # noqa: F401 — valida instalacao
+        from jobspy import scrape_jobs  # noqa: F401
     except ImportError:
         logger.error("[JobSpy] python-jobspy nao instalado. Execute: pip install python-jobspy")
         return []
 
     location = _normalizar_location(cidade)
-
-    # Cargo limitado a 3 palavras — termos longos retornam zero resultados
-    cargo_curto = " ".join(cargo.split()[:3]) if cargo.strip() else ""
-
-    # Primeira keyword mais relevante — evita queries com 5+ termos
+    cargo_curto  = " ".join(cargo.split()[:3]) if cargo.strip() else ""
     kw_principal = keywords.split()[0] if keywords.strip() else ""
-
     termo_completo = f"{cargo_curto} {kw_principal}".strip()
 
-    estrategias = [
-        # (sites,                              termo,          local,    hours_old)
-        (["linkedin"],                          termo_completo, location,  168),   # Nivel 1: 7 dias
-        (["linkedin", "indeed"],                cargo_curto,    location,  720),   # Nivel 2: 30 dias cidade
-        (["linkedin", "indeed"],                cargo_curto,    "Brazil",  720),   # Nivel 3: 30 dias Brasil
-        (["linkedin", "indeed", "glassdoor"],   kw_principal or cargo_curto, "Brazil", 1440),  # Nivel 4: 60 dias
+    # ------------------------------------------------------------------ #
+    # BLOCO 1 — Vagas locais
+    # ------------------------------------------------------------------ #
+    estrategias_locais = [
+        (["linkedin"],                         termo_completo,              location,  168),
+        (["linkedin", "indeed"],               cargo_curto,                 location,  720),
+        (["linkedin", "indeed"],               cargo_curto,                 "Brazil",  720),
+        (["linkedin", "indeed", "glassdoor"],  kw_principal or cargo_curto, "Brazil", 1440),
     ]
 
-    for sites, termo, loc, hours in estrategias:
+    vagas_locais: list = []
+    for sites, termo, loc, hours in estrategias_locais:
         if not termo.strip():
             continue
         try:
-            vagas = _scrape_jobspy(sites, termo, loc, quantidade, hours)
-            if vagas:
-                logger.info(
-                    f"[JobSpy] Sucesso | sites={sites} | termo='{termo}' | loc='{loc}'"
-                )
-                return vagas
-            time.sleep(2)  # pausa entre tentativas para evitar rate-limit
+            resultado = _scrape_jobspy(sites, termo, loc, quantidade, hours)
+            if resultado:
+                logger.info(f"[JobSpy] Locais OK | sites={sites} | termo='{termo}' | loc='{loc}'")
+                vagas_locais = resultado
+                break
+            time.sleep(2)
         except Exception as e:
-            logger.warning(
-                f"[JobSpy] Estrategia falhou (sites={sites}, termo='{termo}'): {e}"
-            )
+            logger.warning(f"[JobSpy] Estrategia local falhou (termo='{termo}'): {e}")
             time.sleep(3)
 
-    logger.warning("[JobSpy] Todas as estrategias falharam. Nenhuma vaga retornada.")
-    return []
+    # ------------------------------------------------------------------ #
+    # BLOCO 2 — Vagas remotas (executado em paralelo ao bloco 1)
+    # ------------------------------------------------------------------ #
+    vagas_remotas: list = []
+    if buscar_remoto:
+        cargo_en = _traduzir_cargo_en(cargo_curto)
+        kw_en    = kw_principal  # tecnologias ja sao em ingles (Python, SQL, AWS...)
+
+        estrategias_remotas = [
+            # PT — remoto no Brasil
+            (["linkedin", "indeed"], f"{cargo_curto} remoto",      "Brazil",    720),
+            (["linkedin"],           f"{cargo_curto} home office",  "Brazil",    720),
+        ]
+
+        if ingles_fluente:
+            # EN — vagas globais
+            estrategias_remotas += [
+                (["linkedin"],          f"{cargo_en} remote",        "Worldwide",  720),
+                (["linkedin", "indeed"],f"{cargo_en} {kw_en} remote","Worldwide",  720),
+                (["linkedin"],          f"{kw_en} remote",           "Worldwide", 1440),
+            ]
+
+        for sites, termo, loc, hours in estrategias_remotas:
+            if not termo.strip():
+                continue
+            try:
+                resultado = _scrape_jobspy(sites, termo, loc, max(quantidade // 2, 5), hours)
+                if resultado:
+                    logger.info(f"[JobSpy] Remotas OK | termo='{termo}' | loc='{loc}'")
+                    vagas_remotas = resultado
+                    break
+                time.sleep(2)
+            except Exception as e:
+                logger.warning(f"[JobSpy] Estrategia remota falhou (termo='{termo}'): {e}")
+                time.sleep(3)
+
+    # ------------------------------------------------------------------ #
+    # MERGE — remove duplicatas por (title.lower + company.lower)
+    # ------------------------------------------------------------------ #
+    todas = vagas_locais + vagas_remotas
+    vistas: set = set()
+    unicas: list = []
+    for v in todas:
+        chave = f"{v.get('title','').lower().strip()}|{v.get('company','').lower().strip()}"
+        if chave not in vistas:
+            vistas.add(chave)
+            unicas.append(v)
+
+    if not unicas:
+        logger.warning("[JobSpy] Todas as estrategias falharam. Nenhuma vaga retornada.")
+
+    return unicas
