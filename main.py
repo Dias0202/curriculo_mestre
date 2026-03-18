@@ -32,7 +32,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-from fpdf import FPDF
+import fitz
 from supabase import create_client, Client
 
 from scraper import extrair_vaga_linkedin, buscar_vagas_jobspy
@@ -103,16 +103,14 @@ def sanitize(text: str) -> str:
 def extrair_texto_arquivo(file_bytes: bytearray, filename: str) -> str:
     if filename.lower().endswith(".pdf"):
         try:
-            from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(bytes(file_bytes)))
-            return "\n".join(p.extract_text() for p in reader.pages if p.extract_text())
+            # Carrega o PDF a partir do buffer de memoria
+            doc = fitz.open("pdf", file_bytes)
+            # O parametro 'text' garante extracao respeitando a ordem de leitura
+            texto = chr(12).join([page.get_text("text") for page in doc])
+            return texto
         except Exception as e:
-            logger.error(f"[PDF] {e}")
+            logger.error(f"[PDF] Falha de extração via PyMuPDF: {e}")
             return ""
-    for enc in ["utf-8", "latin-1", "cp1252"]:
-        try: return file_bytes.decode(enc)
-        except UnicodeDecodeError: continue
-    return file_bytes.decode("utf-8", errors="ignore")
 
 # =========================================================
 # GERADOR DE PDF — Consome o JSON exato do Prompt 2 (Recrutador Senior)
