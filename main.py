@@ -1,11 +1,6 @@
 """
-ATS Resume Bot — Versao Definitiva
-Integra:
-  - Prompt 1: Engenheiro de Dados (consolidacao de perfil -> JSON estruturado)
-  - Prompt 2: Recrutador Senior (geracao de CV ATS -> JSON com schema completo)
-  - PDF Harvard (consume o JSON do Prompt 2 fielmente)
-  - Scraper LinkedIn (URL colada pelo usuario + busca ativa diaria via JobSpy)
-  - Sugestoes diarias automaticas ao meio-dia (Brasilia)
+ATS Resume Bot — Hub de Carreiras
+Arquitetura Serverless, processamento assincrono e pipeline integrado de vagas.
 """
 
 import os
@@ -15,6 +10,7 @@ import json
 import logging
 import hashlib
 import threading
+import fitz  # PyMuPDF
 from datetime import time as dtime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo
@@ -32,7 +28,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-import fitz
+from fpdf import FPDF
 from supabase import create_client, Client
 
 from scraper import extrair_vaga_linkedin, buscar_vagas_jobspy
@@ -40,7 +36,7 @@ from scraper import extrair_vaga_linkedin, buscar_vagas_jobspy
 # =========================================================
 # ESTADOS DO ONBOARDING
 # =========================================================
-ASK_NOME, ASK_EMAIL, ASK_PHONE, ASK_LINKEDIN, ASK_CITY, ASK_LANGUAGE = range(6)
+ASK_NOME, ASK_EMAIL, ASK_PHONE, ASK_LINKEDIN, ASK_CITY, ASK_LANGUAGE, ASK_TARGET_ROLE, ASK_SENIORITY = range(8)
 
 # =========================================================
 # LOGGING E ENV
@@ -58,9 +54,6 @@ if not all([TELEGRAM_TOKEN, GROQ_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
     logger.error("ERRO CRITICO: Variaveis de ambiente ausentes.")
     raise SystemExit(1)
 
-# =========================================================
-# CLIENTES
-# =========================================================
 llm_client: Groq   = Groq(api_key=GROQ_API_KEY)
 db_client:  Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -72,16 +65,16 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"ATS Bot OK")
+        self.wfile.write(b"ATS Bot Operacional")
     def log_message(self, *a): pass
 
 def start_health_server():
     port = int(os.getenv("PORT", 10000))
-    logger.info(f"[Health] Porta {port}")
+    logger.info(f"[Health] Servidor operando na porta {port}")
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # =========================================================
-# SANITIZACAO — fpdf2 usa latin-1 internamente
+# SANITIZACAO DE TEXTO
 # =========================================================
 _SUBS = {
     "\u2022": "-", "\u2013": "-", "\u2014": "-",
@@ -98,28 +91,23 @@ def sanitize(text: str) -> str:
     return text.encode("latin-1", "ignore").decode("latin-1")
 
 # =========================================================
-# EXTRACAO DE TEXTO DE ARQUIVO
+# EXTRACAO DE TEXTO DE ARQUIVO (PyMuPDF)
 # =========================================================
 def extrair_texto_arquivo(file_bytes: bytearray, filename: str) -> str:
     if filename.lower().endswith(".pdf"):
         try:
-            # Carrega o PDF a partir do buffer de memoria
             doc = fitz.open("pdf", file_bytes)
-            # O parametro 'text' garante extracao respeitando a ordem de leitura
-            texto = chr(12).join([page.get_text("text") for page in doc])
-            return texto
+            return chr(12).join([page.get_text("text") for page in doc])
         except Exception as e:
-            logger.error(f"[PDF] Falha de extração via PyMuPDF: {e}")
+            logger.error(f"[PDF] Falha de extracao via PyMuPDF: {e}")
             return ""
+    for enc in ["utf-8", "latin-1", "cp1252"]:
+        try: return file_bytes.decode(enc)
+        except UnicodeDecodeError: continue
+    return file_bytes.decode("utf-8", errors="ignore")
 
 # =========================================================
-# GERADOR DE PDF — Consome o JSON exato do Prompt 2 (Recrutador Senior)
-#
-# Secoes (em ordem Harvard):
-#   cabecalho (identificacao) | resumo | competencias |
-#   experiencias | educacao | certificacoes | projetos | idiomas
-#
-# "relatorio_analitico" NAO vai no PDF — enviado como mensagem separada.
+# GERADOR DE PDF (Padrao Harvard)
 # =========================================================
 class CurriculoHarvard(FPDF):
     def __init__(self):
@@ -128,9 +116,7 @@ class CurriculoHarvard(FPDF):
         self.add_page()
         self.set_auto_page_break(True, margin=15)
 
-    # ------ Primitivas ------
     def _secao(self, titulo: str):
-        """Linha de secao com underline, estilo Harvard."""
         self.ln(2)
         self.set_font("helvetica", "B", 11)
         self.cell(0, 7, sanitize(titulo.upper()), new_x="LMARGIN", new_y="NEXT")
@@ -138,8 +124,7 @@ class CurriculoHarvard(FPDF):
         self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
         self.ln(2)
 
-    def _linha(self, txt: str, size: int = 10, bold: bool = False, italic: bool = False,
-               align: str = "L"):
+    def _linha(self, txt: str, size: int = 10, bold: bool = False, italic: bool = False, align: str = "L"):
         style = ("B" if bold else "") + ("I" if italic else "")
         self.set_font("helvetica", style, size)
         self.multi_cell(0, 5, sanitize(txt), align=align, new_x="LMARGIN", new_y="NEXT")
@@ -148,26 +133,19 @@ class CurriculoHarvard(FPDF):
         self.set_font("helvetica", "", 10)
         self.multi_cell(0, 5, sanitize(f"{prefixo} {txt}"), new_x="LMARGIN", new_y="NEXT")
 
-    # ------ Blocos ------
     def bloco_cabecalho(self, ident: dict):
-        """Nome, titulo profissional e faixa de contatos centrados."""
         nome   = ident.get("nome", "")
         titulo = ident.get("titulo", "")
-
         self.set_font("helvetica", "B", 18)
         self.multi_cell(0, 10, sanitize(nome), align="C", new_x="LMARGIN", new_y="NEXT")
-
         if titulo:
             self.set_font("helvetica", "I", 11)
             self.multi_cell(0, 6, sanitize(titulo), align="C", new_x="LMARGIN", new_y="NEXT")
-
-        # Linha de contatos: email | telefone | linkedin | localizacao | github | portfolio
         campos = ["email", "telefone", "linkedin", "localizacao", "github", "portfolio"]
         contatos = [str(ident.get(c, "")).strip() for c in campos if ident.get(c, "").strip()]
         if contatos:
             self.set_font("helvetica", "", 9)
-            self.multi_cell(0, 5, sanitize("  |  ".join(contatos)),
-                            align="C", new_x="LMARGIN", new_y="NEXT")
+            self.multi_cell(0, 5, sanitize("  |  ".join(contatos)), align="C", new_x="LMARGIN", new_y="NEXT")
         self.ln(4)
 
     def bloco_resumo(self, titulo: str, texto: str):
@@ -178,7 +156,6 @@ class CurriculoHarvard(FPDF):
     def bloco_competencias(self, titulo: str, lista: list):
         if not lista: return
         self._secao(titulo)
-        # Separador "|" — latin-1 seguro (bullet \u2022 nao e suportado pelo helvetica)
         itens = [sanitize(str(i)) for i in lista if i]
         self.set_font("helvetica", "", 10)
         self.multi_cell(0, 5, "  |  ".join(itens), new_x="LMARGIN", new_y="NEXT")
@@ -188,7 +165,6 @@ class CurriculoHarvard(FPDF):
         self._secao(titulo)
         for exp in exps:
             if not isinstance(exp, dict): continue
-
             cargo     = exp.get("cargo", "")
             empresa   = exp.get("empresa", "")
             local_exp = exp.get("localizacao", "")
@@ -196,37 +172,30 @@ class CurriculoHarvard(FPDF):
             fim       = exp.get("data_fim", "")
             desc_emp  = exp.get("descricao_empresa", "")
 
-            # Linha 1: Cargo — Empresa
             self.set_font("helvetica", "B", 11)
             self.cell(0, 6, sanitize(f"{cargo}  —  {empresa}"), new_x="LMARGIN", new_y="NEXT")
 
-            # Linha 2: Periodo | Local (italico, menor)
-            meta = f"{inicio} – {fim}"
+            meta = f"{inicio} - {fim}"
             if local_exp: meta += f"  |  {local_exp}"
             self.set_font("helvetica", "I", 9)
             self.cell(0, 5, sanitize(meta), new_x="LMARGIN", new_y="NEXT")
 
-            # Descricao da empresa (opcional)
             if desc_emp:
                 self.set_font("helvetica", "I", 9)
                 self.multi_cell(0, 4, sanitize(desc_emp), new_x="LMARGIN", new_y="NEXT")
-
             self.ln(1)
 
-            # Responsabilidades
             resps = exp.get("responsabilidades", [])
             if isinstance(resps, str): resps = [resps]
             for r in resps:
                 if r: self._bullet(r, "-")
 
-            # Conquistas (destaque com seta)
             conquistas = exp.get("conquistas", [])
             if isinstance(conquistas, str): conquistas = [conquistas]
             for c in conquistas:
                 if c:
                     self.set_font("helvetica", "B", 10)
-                    self.multi_cell(0, 5, sanitize(f"» {c}"), new_x="LMARGIN", new_y="NEXT")
-
+                    self.multi_cell(0, 5, sanitize(f">> {c}"), new_x="LMARGIN", new_y="NEXT")
             self.ln(3)
 
     def bloco_educacao(self, titulo: str, edus: list):
@@ -239,16 +208,14 @@ class CurriculoHarvard(FPDF):
             inst  = edu.get("instituicao", "")
             ini   = edu.get("ano_inicio", "")
             fim   = edu.get("ano_fim", "")
-
             cabecalho = f"{grau} em {curso}" if grau else curso
             self.set_font("helvetica", "B", 11)
             self.cell(0, 6, sanitize(cabecalho), new_x="LMARGIN", new_y="NEXT")
             self.set_font("helvetica", "I", 10)
-            self.cell(0, 5, sanitize(f"{inst}  |  {ini} – {fim}"), new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 5, sanitize(f"{inst}  |  {ini} - {fim}"), new_x="LMARGIN", new_y="NEXT")
             self.ln(3)
 
     def bloco_lista_simples(self, titulo: str, itens: list):
-        """Certificacoes e Idiomas — lista simples de strings."""
         if not itens: return
         self._secao(titulo)
         self.set_font("helvetica", "", 10)
@@ -265,40 +232,19 @@ class CurriculoHarvard(FPDF):
             self.set_font("helvetica", "B", 10)
             self.cell(0, 6, sanitize(proj.get("nome", "")), new_x="LMARGIN", new_y="NEXT")
             self.set_font("helvetica", "", 10)
-            self.multi_cell(0, 5, sanitize(proj.get("descricao", "")),
-                            new_x="LMARGIN", new_y="NEXT")
+            self.multi_cell(0, 5, sanitize(proj.get("descricao", "")), new_x="LMARGIN", new_y="NEXT")
             self.ln(2)
 
     def bloco_keywords_ocultas(self, keywords: list):
-        """
-        Injeta keywords ausentes do perfil em fonte tamanho 1, cor branca.
-        Invisiveis para humanos, mas lidas pelo parser de texto dos sistemas ATS.
-        Posicionadas apos o ultimo bloco visivel, dentro da margem do documento.
-        """
-        if not keywords:
-            return
+        if not keywords: return
         termos = [sanitize(str(k)) for k in keywords if k]
-        if not termos:
-            return
-        # Salva estado de cor atual
-        self.set_text_color(255, 255, 255)   # branco = invisivel no fundo branco
-        self.set_font("helvetica", "", 1)    # fonte minuscula — nao ocupa espaco visual
-        self.multi_cell(
-            0, 1,
-            " ".join(termos),
-            new_x="LMARGIN", new_y="NEXT",
-        )
-        self.set_text_color(0, 0, 0)         # restaura preto
-
+        if not termos: return
+        self.set_text_color(255, 255, 255)
+        self.set_font("helvetica", "", 1)
+        self.multi_cell(0, 1, " ".join(termos), new_x="LMARGIN", new_y="NEXT")
+        self.set_text_color(0, 0, 0)
 
 def gerar_pdf(cv: dict) -> io.BytesIO:
-    """
-    Recebe o JSON gerado pelo Prompt 2 (Recrutador Senior) e compila o PDF Harvard.
-    Campos usados: cabecalhos, identificacao, resumo, competencias,
-                   experiencias, educacao, certificacoes, projetos, idiomas,
-                   keywords_ocultas (texto branco — ATS stealth).
-    'relatorio_analitico' e ignorado aqui (enviado como mensagem).
-    """
     if not isinstance(cv, dict): cv = {}
     cab = cv.get("cabecalhos", {})
     pdf = CurriculoHarvard()
@@ -311,7 +257,6 @@ def gerar_pdf(cv: dict) -> io.BytesIO:
     pdf.bloco_lista_simples(cab.get("certificacoes", "Certificacoes"), cv.get("certificacoes", []))
     pdf.bloco_projetos(cab.get("projetos", "Projetos"), cv.get("projetos", []))
     pdf.bloco_lista_simples(cab.get("idiomas", "Idiomas"), cv.get("idiomas", []))
-    # Keywords ocultas — injetadas apos o ultimo bloco visivel
     pdf.bloco_keywords_ocultas(cv.get("keywords_ocultas", []))
 
     buf = io.BytesIO()
@@ -320,7 +265,7 @@ def gerar_pdf(cv: dict) -> io.BytesIO:
     return buf
 
 # =========================================================
-# GROQ — HELPER CENTRALIZADO
+# GROQ E PROMPTS
 # =========================================================
 _MODEL = "llama-3.3-70b-versatile"
 
@@ -342,22 +287,15 @@ def _chat(system: str, prompt: str, json_mode: bool = False, temperature: float 
 def _parse_json(raw: str) -> dict:
     return json.loads(re.sub(r"```json|```", "", raw).strip())
 
-# =========================================================
-# PROMPT 1 — ENGENHEIRO DE DADOS
-# Consolida historico bruto no perfil estruturado do Supabase
-# =========================================================
 _SYSTEM_CONSOLIDAR = """INSTRUCAO: Voce atua como um Engenheiro de Dados especialista em parsing de documentos de Recursos Humanos.
-Sua funcao e analisar o PERFIL ATUAL do candidato armazenado no banco de dados relacional e a NOVA ENTRADA de dados fornecida pelo usuario. Seu objetivo e retornar um JSON consolidado, normalizado e atualizado que mapeia perfeitamente para as tabelas do sistema (Supabase).
+Sua funcao e analisar o PERFIL ATUAL do candidato armazenado no banco de dados relacional e a NOVA ENTRADA de dados fornecida pelo usuario. Seu objetivo e retornar um JSON consolidado, normalizado e atualizado.
 
 REGRAS DE MERGE E EXTRACAO:
-1. RESOLUCAO DE CONFLITOS: Se a NOVA ENTRADA for um curriculo completo ou historico abrangente, atualize os dados existentes e remova duplicidades logicas. Se for apenas uma atualizacao pontual, insira o novo dado sem apagar o restante do PERFIL ATUAL.
-2. NORMALIZACAO DE DADOS: Padronize as datas para o formato "Mes/Ano" (ex: Jan/2020) ou apenas "Ano". Categorize as skills estritamente como "Hard Skill" ou "Soft Skill".
-3. FIDELIDADE: Nao resuma as descricoes, responsabilidades e conquistas. Mantenha a integridade do texto original.
-4. DADOS NAO-TRADICIONAIS (CRITICO): Intercambios, trabalhos voluntarios, freelances e projetos pessoais SAO dados validos. Aplique o seguinte roteamento estrutural:
-   - FREELANCES: Mapeie para "experiences" (ex: cargo = "Desenvolvedor Freelance", empresa = "Autonomo" ou Nome do Cliente).
-   - PROJETOS PESSOAIS / ACADEMICOS: Mapeie para "projects", capturando nome e descricao tecnica (incluindo tecnologias).
-   - INTERCAMBIOS: Se primariamente estudo, mapeie para "education". Se envolveu trabalho/vivencia pratica, mapeie para "experiences".
-5. FORMATO: Retorne EXCLUSIVAMENTE um objeto JSON valido, sem marcadores de markdown.
+1. RESOLUCAO DE CONFLITOS: Se a NOVA ENTRADA for um curriculo completo ou historico abrangente, atualize os dados existentes e remova duplicidades logicas. Se for apenas uma atualizacao pontual, insira o novo dado sem apagar o restante.
+2. NORMALIZACAO DE DADOS: Padronize as datas para o formato "Mes/Ano". Categorize as skills como "Hard Skill" ou "Soft Skill".
+3. FIDELIDADE: Nao resuma as descricoes, responsabilidades e conquistas. Mantenha a integridade do texto.
+4. DADOS NAO-TRADICIONAIS: Mapeie freelances para "experiences", projetos para "projects" e intercambios para "education" ou "experiences".
+5. FORMATO: Retorne EXCLUSIVAMENTE um objeto JSON valido.
 
 SCHEMA EXIGIDO:
 {
@@ -365,10 +303,10 @@ SCHEMA EXIGIDO:
     {"cargo":"","empresa":"","localizacao":"","data_inicio":"","data_fim":"Presente ou data","descricao_empresa":"","responsabilidades":[],"conquistas":[]}
   ],
   "education": [
-    {"grau":"Bacharelado/Mestrado/etc","curso":"Nome exato","instituicao":"","ano_inicio":"","ano_fim":""}
+    {"grau":"","curso":"","instituicao":"","ano_inicio":"","ano_fim":""}
   ],
   "skills": [
-    {"nome":"","categoria":"Hard Skill ou Soft Skill","nivel":"Iniciante, Intermediario ou Avancado"}
+    {"nome":"","categoria":"","nivel":""}
   ],
   "certifications": [
     {"nome":"","emissor":"","ano":""}
@@ -377,113 +315,59 @@ SCHEMA EXIGIDO:
     {"nome":"","descricao":""}
   ],
   "languages": [
-    {"idioma":"","nivel":"Basico, Intermediario, Fluente ou Nativo"}
+    {"idioma":"","nivel":""}
   ]
 }"""
 
-# =========================================================
-# PROMPT 2 — RECRUTADOR SENIOR
-# Gera o JSON completo do CV otimizado para ATS
-# =========================================================
-_SYSTEM_CV = """INSTRUCAO SUPREMA: Voce atua como um Recrutador Tecnico Senior, Especialista em Sistemas ATS (Applicant Tracking Systems) e Estrategista de Carreira.
-Sua missao e cruzar o HISTORICO do candidato com os dados estruturados da VAGA ALVO e criar um curriculo ALTAMENTE DIRECIONADO para burlar os filtros algoritmicos do ATS e fornecer insights de carreira acionaveis.
+_SYSTEM_CV = """INSTRUCAO SUPREMA: Voce atua como um Recrutador Tecnico Senior e Especialista em Sistemas ATS.
+Sua missao e cruzar o HISTORICO do candidato com os dados estruturados da VAGA ALVO e criar um curriculo direcionado.
 
 REGRAS VITAIS E ALGORITMICAS:
-1. MAPEAMENTO DE PALAVRAS-CHAVE (ATS SEO): Analise a VAGA ALVO, identifique as hard skills, soft skills e ferramentas exigidas. Injete essas exatas palavras-chave de forma organica e contextualizada no "resumo", "competencias" e "responsabilidades", SEMPRE que o historico original der suporte a isso.
-2. PREVENCAO DE ALUCINACAO (STRICT FACTUALITY): NUNCA invente experiencias, cargos, ferramentas ou graduacoes que nao existam no HISTORICO do candidato. Se o candidato nao possui um requisito da vaga, omita-o do curriculo e liste-o em "analise_gaps".
-3. METODO STAR OTIMIZADO: Reescreva os bullet points de experiencias focando em impacto quantificavel (Situacao, Tarefa, Acao, Resultado). Inicie sempre com verbos de acao fortes.
-4. ALAVANCAGEM DE BACKGROUND (CRITICO): Valorize intensamente Projetos Pessoais, Academicos e trabalhos Freelance. Use-os estrategicamente para compensar eventuais faltas de experiencia formal.
-5. IDIOMA: Todo o conteudo gerado deve ser rigorosamente redigido no idioma especificado pelo campo IDIOMA.
-6. KEYWORDS OCULTAS (ATS STEALTH): No campo "keywords_ocultas", liste TODOS os termos exigidos pela vaga que o candidato NAO possui experiencia comprovada. Esses termos serao inseridos no PDF em fonte branca (invisivel para humanos, mas lido pelo parser ATS). Liste apenas termos tecnicos, ferramentas e certificacoes — nao inclua frases completas.
-7. FORMATO STRICT JSON: Retorne apenas o JSON puro, sem formatacao markdown, sem explicacoes adicionais.
+1. MAPEAMENTO DE PALAVRAS-CHAVE: Injete as exatas palavras-chave exigidas pela vaga de forma organica no "resumo", "competencias" e "responsabilidades", SEMPRE que o historico original der suporte.
+2. PREVENCAO DE ALUCINACAO: NUNCA invente experiencias. Se o candidato nao possui um requisito, omita-o do curriculo e liste-o em "analise_gaps".
+3. METODO STAR: Reescreva os bullet points de experiencias focando em impacto quantificavel.
+4. ALAVANCAGEM DE BACKGROUND: Valorize Projetos Pessoais e trabalhos Freelance para compensar lacunas formais.
+5. KEYWORDS OCULTAS: No campo "keywords_ocultas", liste TODOS os termos exigidos pela vaga que o candidato NAO possui experiencia comprovada.
+6. FORMATO: Retorne apenas o JSON puro.
 
 SCHEMA OBRIGATORIO:
 {
   "cabecalhos": {
-    "resumo": "NOME DA SECAO NA LINGUA ALVO",
-    "competencias": "NOME DA SECAO NA LINGUA ALVO",
-    "experiencias": "NOME DA SECAO NA LINGUA ALVO",
-    "educacao": "NOME DA SECAO NA LINGUA ALVO",
-    "certificacoes": "NOME DA SECAO NA LINGUA ALVO",
-    "projetos": "NOME DA SECAO NA LINGUA ALVO",
-    "idiomas": "NOME DA SECAO NA LINGUA ALVO"
+    "resumo": "", "competencias": "", "experiencias": "", "educacao": "", "certificacoes": "", "projetos": "", "idiomas": ""
   },
   "identificacao": {
-    "nome": "",
-    "titulo": "Titulo profissional forte contendo a palavra-chave principal da vaga",
-    "localizacao": "Cidade, Estado",
-    "telefone": "",
-    "email": "",
-    "linkedin": "",
-    "github": "",
-    "portfolio": ""
+    "nome": "", "titulo": "", "localizacao": "", "telefone": "", "email": "", "linkedin": "", "github": "", "portfolio": ""
   },
-  "resumo": "Paragrafo estrategico de 4 a 6 linhas com resumo de qualificacoes focado na vaga alvo, contendo as principais palavras-chave da descricao da vaga.",
-  "competencias": ["Palavra-chave 1 (priorize termos exatos da vaga)", "Palavra-chave 2"],
+  "resumo": "",
+  "competencias": [],
   "experiencias": [
     {
-      "cargo": "Nome do Cargo",
-      "empresa": "Nome da Empresa",
-      "localizacao": "Local",
-      "data_inicio": "Mes/Ano",
-      "data_fim": "Mes/Ano ou Presente",
-      "descricao_empresa": "1 linha sobre a empresa (opcional)",
-      "responsabilidades": ["Verbo de Acao + Contexto + Palavra-chave da vaga utilizada"],
-      "conquistas": ["Resultado metrico claro via metodo STAR (ex: Aumentou X% fazendo Y)"]
+      "cargo": "", "empresa": "", "localizacao": "", "data_inicio": "", "data_fim": "", "descricao_empresa": "",
+      "responsabilidades": [], "conquistas": []
     }
   ],
   "educacao": [
-    {
-      "grau": "Nivel academico",
-      "curso": "Nome do curso + Enfoque direcionado a vaga",
-      "instituicao": "Nome da Instituicao",
-      "ano_inicio": "Ano",
-      "ano_fim": "Ano"
-    }
+    {"grau": "", "curso": "", "instituicao": "", "ano_inicio": "", "ano_fim": ""}
   ],
-  "certificacoes": ["Nome da Certificacao - Emissor - Ano"],
-  "projetos": [
-    {
-      "nome": "Nome do Projeto",
-      "descricao": "Descricao focada em resolucao de problemas, tecnologias alinhadas a vaga e link do repositorio se existir"
-    }
-  ],
-  "idiomas": ["Idioma - Nivel"],
-  "keywords_ocultas": ["termo1", "termo2", "termo3"],
+  "certificacoes": [],
+  "projetos": [{"nome": "", "descricao": ""}],
+  "idiomas": [],
+  "keywords_ocultas": [],
   "relatorio_analitico": {
-    "match_score": 0,
-    "analise_gaps": ["requisito da vaga que o candidato NAO possui"],
-    "dica_entrevista": "Pergunta tecnica/comportamental que os recrutadores fariam + como o candidato deve responder usando experiencia real do historico"
+    "match_score": 0, "analise_gaps": [], "dica_entrevista": ""
   }
 }"""
 
-# =========================================================
-# FUNCOES LLM
-# =========================================================
 def classificar_intencao(texto: str) -> str:
-    """
-    Retorna uma de cinco categorias:
-      URL_LINKEDIN — link de vaga do LinkedIn
-      VAGA         — descricao de cargo/emprego
-      HISTORICO    — curriculo ou historico profissional completo
-      EDICAO       — instrucao de edicao do perfil ('remova X', 'atualize meu telefone', etc.)
-      OUTRO        — mensagem nao relacionada ao bot (saudacoes, perguntas gerais, etc.)
-    """
     if re.search(r"linkedin\.com/jobs", texto, re.IGNORECASE):
         return "URL_LINKEDIN"
     raw = _chat(
-        system=(
-            "Voce classifica mensagens enviadas a um bot de curriculo profissional. "
-            "Responda APENAS com uma palavra: VAGA, HISTORICO, EDICAO ou OUTRO."
-        ),
+        system="Classifique mensagens enviadas a um bot de carreira. Responda APENAS: VAGA, HISTORICO, EDICAO ou OUTRO.",
         prompt=(
-            "Categorias:\n"
-            "VAGA     = descricao de cargo/emprego publicada por uma empresa\n"
-            "HISTORICO = curriculo, perfil profissional ou listagem de experiencias de uma pessoa\n"
-            "EDICAO   = instrucao direta para editar o perfil salvo. "
-            "            Exemplos: 'remova a experiencia X', 'meu novo telefone e', "
-            "            'adicione o curso Y', 'atualize minha cidade para'\n"
-            "OUTRO    = qualquer outra coisa: saudacoes, perguntas gerais, textos sem relacao\n\n"
+            "VAGA = descricao de cargo/emprego\n"
+            "HISTORICO = curriculo ou experiencias do usuario\n"
+            "EDICAO = instrucao de atualizacao de dados do perfil\n"
+            "OUTRO = perguntas gerais, conversas\n\n"
             f"Mensagem:\n{texto[:1500]}"
         ),
         temperature=0.0,
@@ -493,189 +377,69 @@ def classificar_intencao(texto: str) -> str:
             return cat
     return "OUTRO"
 
-
 def consolidar_perfil(perfil_atual: dict, nova_entrada: str) -> dict:
-    """Prompt 1: mescla nova entrada ao perfil estruturado existente."""
     raw = _chat(
         system=_SYSTEM_CONSOLIDAR,
-        prompt=(
-            f"PERFIL ATUAL NO BANCO DE DADOS:\n{json.dumps(perfil_atual, ensure_ascii=False)}\n\n"
-            f"NOVA ENTRADA DO USUARIO (Texto bruto, mensagem, PDF ou Word extraido):\n{nova_entrada}"
-        ),
+        prompt=(f"PERFIL ATUAL:\n{json.dumps(perfil_atual, ensure_ascii=False)}\n\n"
+                f"NOVA ENTRADA:\n{nova_entrada}"),
         json_mode=True,
         temperature=0.0,
     )
     return _parse_json(raw)
-
 
 def editar_perfil_llm(perfil_atual: dict, instrucao: str) -> dict:
-    """
-    Aplica uma edicao pontual ao perfil estruturado com base em instrucao em texto livre.
-    Ex: 'Remova a experiencia na empresa X', 'Atualize meu telefone para 31999999999'.
-    Retorna o perfil atualizado no mesmo schema do Prompt 1.
-    """
     raw = _chat(
-        system=(
-            _SYSTEM_CONSOLIDAR +
-            "\n\nMODO EDICAO PONTUAL: O usuario esta pedindo uma alteracao especifica. "
-            "Aplique APENAS a mudanca solicitada. Nao altere nenhum outro dado."
-        ),
-        prompt=(
-            f"PERFIL ATUAL:\n{json.dumps(perfil_atual, ensure_ascii=False)}\n\n"
-            f"INSTRUCAO DE EDICAO DO USUARIO:\n{instrucao}"
-        ),
+        system=(_SYSTEM_CONSOLIDAR + "\n\nMODO EDICAO PONTUAL. Aplique APENAS a mudanca solicitada."),
+        prompt=(f"PERFIL ATUAL:\n{json.dumps(perfil_atual, ensure_ascii=False)}\n\n"
+                f"INSTRUCAO:\n{instrucao}"),
         json_mode=True,
         temperature=0.0,
     )
     return _parse_json(raw)
 
-
 def formatar_perfil_texto(usuario: dict, perfil: dict) -> str:
-    """Formata o perfil estruturado em texto legivel para o Telegram (sem parse_mode)."""
     linhas = []
     nome = usuario.get("nome_completo", "Candidato")
-    linhas.append(f"👤 {nome}")
+    linhas.append(f"Nome: {nome}")
+    linhas.append(f"Objetivo: {usuario.get('cargo_alvo', 'Nao definido')} ({usuario.get('senioridade', 'Nao definido')})")
 
-    email    = usuario.get("email", "")
-    telefone = usuario.get("telefone", "")
-    linkedin = usuario.get("linkedin", "")
-    cidade   = usuario.get("cidade", "")
-    idioma   = usuario.get("idioma", "")
-
-    contato = []
-    if email:    contato.append(f"📧 {email}")
-    if telefone: contato.append(f"📱 {telefone}")
-    if contato:  linhas.append("  |  ".join(contato))
-    if linkedin: linhas.append(f"🔗 {linkedin}")
-    if cidade:   linhas.append(f"📍 {cidade}")
-    if idioma:   linhas.append(f"🌐 Curriculo em: {idioma}")
+    contatos = []
+    for k in ["email", "telefone", "linkedin", "cidade"]:
+        if usuario.get(k): contatos.append(usuario[k])
+    if contatos: linhas.append("Contato: " + " | ".join(contatos))
 
     exps = perfil.get("experiences", [])
     if exps:
-        linhas.append("\n💼 EXPERIENCIAS")
+        linhas.append("\nEXPERIENCIAS")
         for e in exps:
-            cargo   = e.get("cargo", "")
-            empresa = e.get("empresa", "")
-            inicio  = e.get("data_inicio", "")
-            fim     = e.get("data_fim", "")
-            linhas.append(f"• {cargo} | {empresa}")
-            linhas.append(f"  {inicio} -> {fim}")
+            linhas.append(f"- {e.get('cargo', '')} | {e.get('empresa', '')} ({e.get('data_inicio', '')} a {e.get('data_fim', '')})")
 
     edus = perfil.get("education", [])
     if edus:
-        linhas.append("\n🎓 FORMACAO")
+        linhas.append("\nFORMACAO")
         for ed in edus:
-            grau  = ed.get("grau", "")
-            curso = ed.get("curso", "")
-            inst  = ed.get("instituicao", "")
-            ini   = ed.get("ano_inicio", "")
-            fim   = ed.get("ano_fim", "")
-            linhas.append(f"• {grau} em {curso}" if grau else f"• {curso}")
-            linhas.append(f"  {inst} | {ini} - {fim}")
+            linhas.append(f"- {ed.get('curso', '')} | {ed.get('instituicao', '')}")
 
     skills = perfil.get("skills", [])
     if skills:
         hard = [s.get("nome","") for s in skills if "hard" in s.get("categoria","").lower()]
-        soft = [s.get("nome","") for s in skills if "soft" in s.get("categoria","").lower()]
-        linhas.append("\n🛠 COMPETENCIAS")
-        if hard: linhas.append("Hard: " + ", ".join(hard))
-        if soft: linhas.append("Soft: " + ", ".join(soft))
+        if hard: linhas.append("\nTECNOLOGIAS: " + ", ".join(hard))
 
-    certs = perfil.get("certifications", [])
-    if certs:
-        linhas.append("\n📜 CERTIFICACOES")
-        for c in certs:
-            linhas.append(f"• {c.get('nome','')} - {c.get('emissor','')} ({c.get('ano','')})")
-
-    projs = perfil.get("projects", [])
-    if projs:
-        linhas.append("\n🚀 PROJETOS")
-        for p in projs:
-            desc = p.get("descricao", "")[:80]
-            linhas.append(f"• {p.get('nome','')}")
-            if desc: linhas.append(f"  {desc}...")
-
-    langs = perfil.get("languages", [])
-    if langs:
-        linhas.append("\n🌍 IDIOMAS")
-        for l in langs:
-            linhas.append(f"• {l.get('idioma','')} - {l.get('nivel','')}")
-
-    linhas.append(
-        "\nPara editar: descreva a alteracao em texto livre.\n"
-        "Ex: \"Remova a experiencia na empresa X\" ou \"Atualize meu telefone para...\""
-    )
+    linhas.append("\nPara editar: descreva a alteracao em texto livre. Ex: Remova a empresa X.")
     return "\n".join(linhas)
 
-
-def extrair_keywords_para_busca(perfil: dict) -> dict:
-    """
-    Extrai cargo e keywords do perfil estruturado para o JobSpy.
-
-    CRITICO: O campo 'cargo' deve ter NO MAXIMO 3 palavras simples e amplas,
-    prontas para serem usadas como query de busca em sites de emprego.
-    Termos longos ou especificos retornam zero resultados.
-    """
-    raw = _chat(
-        system="Voce extrai dados de perfis profissionais para busca de empregos. Retorne SOMENTE JSON valido.",
-        prompt=(
-            "Analise o perfil abaixo e retorne um JSON com:\n"
-            '- "cargo": titulo do cargo mais recente reduzido a NO MAXIMO 3 palavras curtas e amplas, '
-            'como se fosse uma busca no LinkedIn. NUNCA use frases longas. '
-            'Exemplos corretos: "Desenvolvedor Python", "Analista de Dados", "Engenheiro ML", "Cientista de Dados". '
-            'Exemplos ERRADOS: "Desenvolvedor de Projetos Machine Learning IA Bioinformatica".\n'
-            '- "keywords": apenas 1 ou 2 ferramentas ou tecnologias principais separadas por espaco. '
-            'Exemplos: "Python SQL", "React Node", "AWS Terraform".\n'
-            '- "area": area de atuacao em 2 palavras. Exemplos: "Tecnologia Dados", "Engenharia Software".\n\n'
-            f"PERFIL:\n{json.dumps(perfil, ensure_ascii=False)[:3000]}"
-        ),
-        json_mode=True,
-        temperature=0.0,
-    )
-    try:
-        resultado = _parse_json(raw)
-        # Garante que o cargo nao ultrapasse 3 palavras mesmo se o LLM nao seguir a instrucao
-        cargo = resultado.get("cargo", "")
-        palavras = cargo.split()
-        if len(palavras) > 3:
-            resultado["cargo"] = " ".join(palavras[:3])
-            logger.warning(f"[Keywords] Cargo truncado de '{cargo}' para '{resultado['cargo']}'")
-        logger.info(f"[Keywords] cargo='{resultado.get('cargo')}' keywords='{resultado.get('keywords')}'")
-        return resultado
-    except Exception:
-        return {"cargo": "Analista", "keywords": "", "area": ""}
-
-
 def perfil_tem_ingles_fluente(perfil: dict) -> bool:
-    """
-    Retorna True se o perfil indicar ingles em nivel Intermediario ou superior.
-    Verifica o campo 'languages' do perfil estruturado (Prompt 1).
-    """
-    niveis_ok = {"intermediario", "fluente", "nativo", "avancado",
-                 "intermediate", "fluent", "native", "advanced", "proficient"}
+    niveis_ok = {"intermediario", "fluente", "nativo", "avancado", "intermediate", "fluent", "native", "advanced"}
     for lang in perfil.get("languages", []):
-        if not isinstance(lang, dict):
-            continue
+        if not isinstance(lang, dict): continue
         idioma = lang.get("idioma", "").lower()
         nivel  = lang.get("nivel",  "").lower()
         if "ingl" in idioma or "english" in idioma:
             if any(n in nivel for n in niveis_ok):
-                logger.info(f"[Remoto] Ingles detectado: nivel='{nivel}'")
                 return True
     return False
 
-
-_SCORE_LIMIAR = 60  # vagas abaixo deste score nao sao enviadas
-
-
-def selecionar_melhores_vagas(perfil: dict, vagas: list) -> list:
-    """
-    LLM pontua cada vaga de 0 a 100 contra o perfil.
-    Retorna apenas vagas com score >= 60, ordenadas, maximo 2.
-
-    Normaliza automaticamente se o LLM retornar escala 0-1 (ex: 0.8 -> 80).
-    Se nenhuma vaga passar o limiar, retorna lista vazia (sem fallback silencioso).
-    """
+def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) -> list:
     lista = "\n".join([
         f"{i}. {v.get('title','')} | {v.get('company','')} | {v.get('location','')}\n"
         f"   Descricao: {str(v.get('description',''))[:400]}"
@@ -685,16 +449,15 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list) -> list:
     raw = _chat(
         system="Voce e um recrutador tecnico senior. Retorne SOMENTE JSON valido.",
         prompt=(
-            "Avalie a aderencia de cada vaga ao perfil do candidato.\n\n"
-            "REGRAS DE PONTUACAO (escala INTEIRA de 0 a 100):\n"
-            "- 80-100: cargo, tecnologias E senioridade totalmente alinhados\n"
-            "- 60-79:  cargo e area alinhados, pequenos gaps de tecnologia\n"
-            "- 40-59:  area relacionada mas tecnologias ou senioridade divergem\n"
-            "- 0-39:   area ou cargo completamente diferente do perfil\n\n"
-            "IMPORTANTE: use numeros INTEIROS de 0 a 100. Nao use decimais como 0.8.\n"
-            "Se a vaga exige habilidades que o candidato claramente nao tem, pontue baixo.\n\n"
-            'Retorne APENAS este JSON (sem texto adicional):\n'
-            '{"scores": [{"indice": 0, "score": 75, "motivo": "breve justificativa"}, ...]}\n\n'
+            f"Avalie a aderencia de cada vaga ao perfil do candidato, que busca vagas de nivel: {senioridade_alvo}.\n\n"
+            "REGRAS DE PONTUACAO ESTUDADA (0 a 100):\n"
+            "- REGRA DE ELIMINACAO (Score 0): Se a vaga exige nivel Senior/Pleno e o candidato e Junior/Estagio (ou vice-versa), o score DEVE ser 0. Nao prossiga com a avaliacao tecnologica.\n"
+            "- 80-100: Senioridade exata, cargo exato, dominio de mais de 80% do stack tecnologico.\n"
+            "- 60-79: Senioridade compativel, cargo relacionado, dominio de tecnologias core.\n"
+            "- 0-59: Faltam requisitos fundamentais ou a senioridade diverge totalmente.\n\n"
+            "IMPORTANTE: use numeros INTEIROS de 0 a 100.\n"
+            'Retorne APENAS este JSON:\n'
+            '{"scores": [{"indice": 0, "score": 75, "motivo": "justificativa"}, ...]}\n\n'
             f"PERFIL DO CANDIDATO:\n{json.dumps(perfil, ensure_ascii=False)[:2500]}\n\n"
             f"VAGAS PARA AVALIAR:\n{lista}"
         ),
@@ -704,102 +467,53 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list) -> list:
 
     try:
         scores = _parse_json(raw).get("scores", [])
+        if not scores: return []
 
-        if not scores:
-            logger.warning("[Score] LLM retornou lista de scores vazia.")
-            return []
-
-        # Normaliza escala: se todos os scores estao entre 0-1, multiplica por 100
         valores = [s.get("score", 0) for s in scores if isinstance(s, dict)]
         if valores and max(valores) <= 1.0:
-            logger.info("[Score] Escala 0-1 detectada — normalizando para 0-100.")
             for s in scores:
-                if isinstance(s, dict):
-                    s["score"] = round(s.get("score", 0) * 100)
-
-        # Log de todos os scores para debug
-        for s in scores:
-            idx = s.get("indice", "?")
-            sc  = s.get("score", 0)
-            mot = s.get("motivo", "")
-            titulo = vagas[idx].get("title", "?") if isinstance(idx, int) and idx < len(vagas) else "?"
-            logger.info(f"[Score] idx={idx} | score={sc} | vaga='{titulo}' | {mot}")
+                if isinstance(s, dict): s["score"] = round(s.get("score", 0) * 100)
 
         aprovadas = sorted(
-            [s for s in scores if isinstance(s, dict) and s.get("score", 0) >= _SCORE_LIMIAR],
+            [s for s in scores if isinstance(s, dict) and s.get("score", 0) >= 60],
             key=lambda s: s.get("score", 0),
             reverse=True,
         )
 
-        logger.info(f"[Score] {len(aprovadas)}/{len(vagas)} vagas aprovadas (limiar={_SCORE_LIMIAR})")
-
         resultado = [vagas[s["indice"]] for s in aprovadas[:2]
                      if isinstance(s.get("indice"), int) and s["indice"] < len(vagas)]
 
-        # Adiciona o score como metadado na vaga para exibicao no relatorio
         for s in aprovadas[:2]:
             idx = s.get("indice")
             if isinstance(idx, int) and idx < len(vagas):
                 vagas[idx]["_match_score"] = s.get("score", 0)
 
         return resultado
-
     except Exception as e:
-        logger.error(f"[Score] Erro ao processar pontuacao: {e}", exc_info=True)
-        # Sem fallback — retorna vazio para nao enviar vagas nao avaliadas
+        logger.error(f"[Score] Erro pontuacao: {e}", exc_info=True)
         return []
 
-
-def gerar_cv_json(perfil: dict, usuario: dict,
-                  titulo_vaga: str, empresa_vaga: str,
-                  local_vaga: str, descricao_vaga: str,
-                  com_resumo: bool = True) -> dict:
-    """Prompt 2: gera o JSON completo do curriculo ATS."""
+def gerar_cv_json(perfil: dict, usuario: dict, titulo_vaga: str, empresa_vaga: str, local_vaga: str, descricao_vaga: str, com_resumo: bool = True) -> dict:
     idioma = usuario.get("idioma", "Portugues")
-    instrucao_resumo = (
-        "" if com_resumo
-        else "\nIMPORTANTE: NAO inclua a secao 'resumo' — deixe o campo 'resumo' como string vazia."
-    )
+    instrucao_resumo = "" if com_resumo else "\nIMPORTANTE: Deixe o campo 'resumo' vazio."
     raw = _chat(
         system=_SYSTEM_CV,
         prompt=(
-            f"HISTORICO ESTRUTURADO DO CANDIDATO:\n{json.dumps(perfil, ensure_ascii=False)}\n\n"
-            f"DADOS PESSOAIS DO CANDIDATO:\n"
-            f"Nome: {usuario.get('nome_completo','')}\n"
-            f"Email: {usuario.get('email','')}\n"
-            f"Telefone: {usuario.get('telefone','')}\n"
-            f"LinkedIn: {usuario.get('linkedin','')}\n"
-            f"Cidade: {usuario.get('cidade','')}\n\n"
-            f"VAGA ALVO:\n"
-            f"Titulo: {titulo_vaga}\n"
-            f"Empresa: {empresa_vaga}\n"
-            f"Local: {local_vaga}\n"
-            f"Descricao:\n{descricao_vaga}\n\n"
-            f"IDIOMA DO CURRICULO: {idioma}"
-            f"{instrucao_resumo}"
+            f"HISTORICO DO CANDIDATO:\n{json.dumps(perfil, ensure_ascii=False)}\n\n"
+            f"DADOS DO CANDIDATO:\nNome: {usuario.get('nome_completo','')}\n"
+            f"VAGA ALVO:\nTitulo: {titulo_vaga}\nEmpresa: {empresa_vaga}\nDescricao:\n{descricao_vaga}\n\n"
+            f"IDIOMA: {idioma}{instrucao_resumo}"
         ),
         json_mode=True,
         temperature=0.15,
     )
     return _parse_json(raw)
 
-
 def editar_cv_json(cv_atual: dict, instrucao: str) -> dict:
-    """
-    Aplica uma edicao pontual no JSON do curriculo ja gerado.
-    Ex: 'Mude meu titulo para Senior Data Scientist' ou 'Remova o projeto X'.
-    """
     raw = _chat(
-        system=(
-            "Voce e um especialista em curriculos ATS. "
-            "Aplique APENAS a alteracao solicitada no JSON do curriculo. "
-            "Mantenha todos os outros campos intactos. "
-            "Retorne SOMENTE o JSON completo atualizado, sem markdown."
-        ),
-        prompt=(
-            f"CURRICULO ATUAL (JSON):\n{json.dumps(cv_atual, ensure_ascii=False)}\n\n"
-            f"INSTRUCAO DE EDICAO:\n{instrucao}"
-        ),
+        system="Aplique APENAS a alteracao solicitada no JSON do curriculo. Mantenha os outros campos.",
+        prompt=(f"CURRICULO ATUAL:\n{json.dumps(cv_atual, ensure_ascii=False)}\n\n"
+                f"INSTRUCAO:\n{instrucao}"),
         json_mode=True,
         temperature=0.0,
     )
@@ -812,12 +526,8 @@ def salvar_perfil(telegram_id: int, dados: dict):
     dados["telegram_id"] = str(telegram_id)
     db_client.table("user_profiles").upsert(dados, on_conflict="telegram_id").execute()
 
-
 def atualizar_perfil_estruturado(telegram_id: int, perfil: dict):
-    db_client.table("user_profiles").update(
-        {"perfil_estruturado": perfil}
-    ).eq("telegram_id", str(telegram_id)).execute()
-
+    db_client.table("user_profiles").update({"perfil_estruturado": perfil}).eq("telegram_id", str(telegram_id)).execute()
 
 def buscar_usuario(telegram_id: int) -> dict | None:
     try:
@@ -827,7 +537,6 @@ def buscar_usuario(telegram_id: int) -> dict | None:
         logger.error(f"[Supabase] buscar_usuario: {e}")
         return None
 
-
 def buscar_todos_usuarios() -> list:
     try:
         r = db_client.table("user_profiles").select("*").not_.is_("perfil_estruturado", "null").execute()
@@ -836,7 +545,6 @@ def buscar_todos_usuarios() -> list:
         logger.error(f"[Supabase] buscar_todos: {e}")
         return []
 
-
 def job_ja_enviado(telegram_id: str, job_hash: str) -> bool:
     try:
         r = db_client.table("sent_jobs").select("id").eq("telegram_id", telegram_id).eq("job_hash", job_hash).execute()
@@ -844,236 +552,56 @@ def job_ja_enviado(telegram_id: str, job_hash: str) -> bool:
     except Exception:
         return False
 
-
 def registrar_job_enviado(telegram_id: str, job_hash: str, title: str, company: str):
     try:
         db_client.table("sent_jobs").insert({
-            "telegram_id": telegram_id,
-            "job_hash": job_hash,
-            "job_title": title,
-            "job_company": company,
+            "telegram_id": telegram_id, "job_hash": job_hash, "job_title": title, "job_company": company,
         }).execute()
     except Exception as e:
         logger.error(f"[Supabase] registrar_job: {e}")
-
 
 def gerar_hash_vaga(vaga: dict) -> str:
     chave = f"{vaga.get('title', vaga.get('titulo',''))}{vaga.get('company', vaga.get('empresa',''))}".lower().strip()
     return hashlib.md5(chave.encode()).hexdigest()
 
 # =========================================================
-# PIPELINE: GERA CV + ENVIA PDF + RELATORIO
+# MENUS E CONTROLES DE FLUXO (UX D)
 # =========================================================
-async def processar_e_enviar_vaga(
-    bot, telegram_id: str, usuario: dict, perfil: dict,
-    titulo: str, empresa: str, local: str, descricao: str,
-    url: str = "", job_hash: str = "", indice: int = 1,
-    com_resumo: bool = True, context: ContextTypes.DEFAULT_TYPE = None,
-):
-    cv      = gerar_cv_json(perfil, usuario, titulo, empresa, local, descricao, com_resumo)
-    pdf_buf = gerar_pdf(cv)
-
-    # Armazena ultimo CV gerado no contexto para permitir edicao posterior
-    if context is not None:
-        context.user_data["ultimo_cv"]      = cv
-        context.user_data["ultimo_usuario"] = usuario
-
-    # Nome do arquivo: NomeUsuario_NomeVaga.pdf
-    nome_usuario = usuario.get("nome_completo", "Candidato")
-    nome_vaga    = titulo or empresa or "Vaga"
-    # Remove caracteres invalidos para nome de arquivo
-    def _slug(s: str) -> str:
-        return re.sub(r"[^\w\-]", "_", s.strip())[:40]
-    nome_arquivo = f"{_slug(nome_usuario)}_{_slug(nome_vaga)}.pdf"
-
-    caption = f"Vaga {indice}: {titulo}\nEmpresa: {empresa}\nLocal: {local}"
-    if url and url not in ("nan", ""):
-        caption += f"\nLink: {url}"
-    caption += "\nCom resumo: Sim" if com_resumo else "\nCom resumo: Nao"
-
-    await bot.send_document(
-        chat_id=telegram_id,
-        document=pdf_buf,
-        filename=nome_arquivo,
-        caption=caption,
+async def _enviar_menu(update: Update, context: ContextTypes.DEFAULT_TYPE = None, nome: str = ""):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Buscar Vagas Agora", callback_data="menu_buscar")],
+        [InlineKeyboardButton("Meu Perfil", callback_data="menu_perfil"),
+         InlineKeyboardButton("Deletar Dados", callback_data="menu_deletar")]
+    ])
+    texto = (
+        "Perfil ativo e configurado.\n\n"
+        "Selecione uma acao abaixo ou envie a descricao/link de uma vaga "
+        "para gerar um curriculo adaptado imediatamente."
     )
+    if update.message:
+        await update.message.reply_text(texto, reply_markup=keyboard)
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(texto, reply_markup=keyboard)
 
-    # Relatorio analitico
-    rel = cv.get("relatorio_analitico", {})
-    if rel:
-        score = rel.get("match_score", "?")
-        gaps  = rel.get("analise_gaps", [])
-        dica  = rel.get("dica_entrevista", "")
-        linhas = [f"Relatorio ATS — Vaga {indice}", f"Match Score: {score}/100"]
-        if gaps:
-            linhas.append("\nGaps identificados:")
-            linhas += [f"- {g}" for g in gaps]
-        if dica:
-            linhas.append(f"\nDica para entrevista:\n{dica}")
-        linhas.append("\nPara editar o curriculo gerado, use /editar_cv + descricao da alteracao.")
-        await bot.send_message(chat_id=telegram_id, text="\n".join(linhas))
-
-    if job_hash:
-        registrar_job_enviado(telegram_id, job_hash, titulo, empresa)
-    logger.info(f"[Pipeline] Vaga '{titulo}' enviada para {telegram_id}")
+async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "menu_buscar":
+        await cmd_testar_vagas(update, context)
+    elif query.data == "menu_perfil":
+        await cmd_meu_perfil(update, context)
+    elif query.data == "menu_deletar":
+        await cmd_deletar(update, context)
 
 # =========================================================
-# JOB DIARIO — MEIO-DIA (BRASILIA)
-# =========================================================
-async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("[Scheduler] Iniciando sugestoes diarias...")
-    usuarios = buscar_todos_usuarios()
-    logger.info(f"[Scheduler] {len(usuarios)} usuarios com perfil.")
-
-    for usuario in usuarios:
-        telegram_id = usuario.get("telegram_id")
-        perfil      = usuario.get("perfil_estruturado") or {}
-        cidade      = usuario.get("cidade", "Brazil")
-        if not telegram_id or not perfil: continue
-
-        try:
-            kw              = extrair_keywords_para_busca(perfil)
-            ingles_fluente  = perfil_tem_ingles_fluente(perfil)
-            vagas = buscar_vagas_jobspy(
-                kw.get("cargo", ""), kw.get("keywords", ""), cidade,
-                quantidade=10,
-                buscar_remoto=True,
-                ingles_fluente=ingles_fluente,
-            )
-
-            if not vagas:
-                await context.bot.send_message(
-                    chat_id=telegram_id,
-                    text="Hoje nao encontrei vagas novas para o seu perfil. Tente atualizar seu historico."
-                )
-                continue
-
-            melhores = selecionar_melhores_vagas(perfil, vagas)
-            novas    = [v for v in melhores if not job_ja_enviado(telegram_id, gerar_hash_vaga(v))]
-
-            if not novas:
-                await context.bot.send_message(
-                    chat_id=telegram_id,
-                    text=(
-                        "Hoje nao encontrei vagas com match suficiente (>= 60%) para o seu perfil.\n"
-                        "As vagas disponiveis tinham baixa aderencia ao seu historico.\n"
-                        "Tente atualizar seu perfil com /meuperfil ou aguarde amanha."
-                    )
-                )
-                continue
-
-            await context.bot.send_message(
-                chat_id=telegram_id,
-                text=f"Bom dia! Suas {len(novas)} sugestao(es) de hoje com curriculo adaptado:"
-            )
-
-            for i, vaga in enumerate(novas, 1):
-                try:
-                    await processar_e_enviar_vaga(
-                        bot=context.bot,
-                        telegram_id=telegram_id,
-                        usuario=usuario,
-                        perfil=perfil,
-                        titulo=vaga.get("title",""),
-                        empresa=vaga.get("company",""),
-                        local=vaga.get("location",""),
-                        descricao=vaga.get("description",""),
-                        url=vaga.get("job_url",""),
-                        job_hash=gerar_hash_vaga(vaga),
-                        indice=i,
-                    )
-                except Exception as e:
-                    logger.error(f"[Scheduler] Erro vaga {i} user {telegram_id}: {e}", exc_info=True)
-
-        except Exception as e:
-            logger.error(f"[Scheduler] Erro user {telegram_id}: {e}", exc_info=True)
-
-    logger.info("[Scheduler] Sugestoes diarias concluidas.")
-
-# =========================================================
-# COMANDO /testar_vagas — dispara o job SO para quem enviou o comando
-# =========================================================
-async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    logger.info(f"[Teste] /testar_vagas por user_id={user_id}")
-
-    usuario = buscar_usuario(user_id)
-    perfil  = usuario.get("perfil_estruturado") if usuario else None
-
-    if not perfil:
-        await update.message.reply_text(
-            "Voce ainda nao tem perfil estruturado.\n"
-            "Envie primeiro um .txt ou .pdf com seu historico profissional."
-        )
-        return
-
-    cidade          = usuario.get("cidade", "Brazil")
-    kw              = extrair_keywords_para_busca(perfil)
-    ingles_fluente  = perfil_tem_ingles_fluente(perfil)
-
-    msg_busca = "Buscando vagas locais"
-    if ingles_fluente:
-        msg_busca += " + remotas (PT e EN)"
-    else:
-        msg_busca += " + remotas"
-    await update.message.reply_text(f"{msg_busca}... Aguarde.")
-
-    vagas = buscar_vagas_jobspy(
-        kw.get("cargo", ""), kw.get("keywords", ""), cidade,
-        quantidade=10,
-        buscar_remoto=True,
-        ingles_fluente=ingles_fluente,
-    )
-
-    if not vagas:
-        await update.message.reply_text("Nenhuma vaga encontrada agora. Tente novamente mais tarde.")
-        return
-
-    melhores = selecionar_melhores_vagas(perfil, vagas)
-    novas    = [v for v in melhores if not job_ja_enviado(user_id, gerar_hash_vaga(v))]
-
-    if not novas:
-        motivo = (
-            "As vagas encontradas tiveram match abaixo de 60% com o seu perfil."
-            if melhores == [] else
-            "As vagas com bom match ja foram enviadas anteriormente."
-        )
-        await update.message.reply_text(
-            f"{motivo}\n\nDica: tente atualizar seu perfil com /meuperfil para melhorar os resultados."
-        )
-        return
-
-    await update.message.reply_text(f"Encontrei {len(novas)} vaga(s)! Gerando curriculos adaptados...")
-
-    for i, vaga in enumerate(novas, 1):
-        try:
-            await processar_e_enviar_vaga(
-                bot=context.bot,
-                telegram_id=user_id,
-                usuario=usuario,
-                perfil=perfil,
-                titulo=vaga.get("title",""),
-                empresa=vaga.get("company",""),
-                local=vaga.get("location",""),
-                descricao=vaga.get("description",""),
-                url=vaga.get("job_url",""),
-                job_hash=gerar_hash_vaga(vaga),
-                indice=i,
-            )
-        except Exception as e:
-            logger.error(f"[Teste] Erro vaga {i}: {e}", exc_info=True)
-            await update.message.reply_text(f"Erro ao processar vaga {i}: {e}")
-
-# =========================================================
-# ONBOARDING — CONVERSATION HANDLER
+# ONBOARDING (UX B)
 # =========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     usuario = buscar_usuario(user_id)
-
     if usuario and usuario.get("email"):
         nome = usuario.get("nome_completo", update.effective_user.first_name or "")
-        await _enviar_menu(update, nome)
+        await _enviar_menu(update, context, nome)
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -1083,76 +611,85 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ASK_NOME
 
-
 async def ask_nome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["nome_completo"] = update.message.text.strip()
     await update.message.reply_text("Qual o seu E-MAIL profissional?")
     return ASK_EMAIL
-
 
 async def ask_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["email"] = update.message.text.strip()
     await update.message.reply_text("Qual o seu TELEFONE? (com DDD)")
     return ASK_PHONE
 
-
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["telefone"] = update.message.text.strip()
     await update.message.reply_text("Qual o seu perfil no LINKEDIN? (URL completo)")
     return ASK_LINKEDIN
 
-
 async def ask_linkedin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["linkedin"] = update.message.text.strip()
-    await update.message.reply_text("Qual a sua CIDADE e ESTADO?\nExemplo: Sao Paulo, SP")
+    await update.message.reply_text("Qual a sua CIDADE e ESTADO? (Exemplo: Sao Paulo, SP)")
     return ASK_CITY
-
 
 async def ask_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["cidade"] = update.message.text.strip()
-    await update.message.reply_text(
-        "Em qual IDIOMA deseja o curriculo?\nExemplos: Portugues, Ingles, Espanhol"
-    )
+    await update.message.reply_text("Em qual IDIOMA deseja o curriculo? (Exemplos: Portugues, Ingles)")
     return ASK_LANGUAGE
 
-
 async def ask_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["idioma"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Qual o cargo exato que voce busca?\n"
+        "Exemplos: Desenvolvedor Python, Analista de Dados, Engenheiro DevOps"
+    )
+    return ASK_TARGET_ROLE
+
+async def ask_target_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["cargo_alvo"] = update.message.text.strip()
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Estagio", callback_data="sen_Estagio"),
+         InlineKeyboardButton("Junior", callback_data="sen_Junior")],
+        [InlineKeyboardButton("Pleno", callback_data="sen_Pleno"),
+         InlineKeyboardButton("Senior", callback_data="sen_Senior")],
+        [InlineKeyboardButton("Especialista", callback_data="sen_Especialista")]
+    ])
+    await update.message.reply_text("Qual o seu nivel de experiencia atual/desejado?", reply_markup=keyboard)
+    return ASK_SENIORITY
+
+async def callback_seniority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    senioridade = query.data.split("_")[1]
     user_id = update.effective_user.id
+    cargo_alvo = context.user_data.get("cargo_alvo", "")
+
     salvar_perfil(user_id, {
         "nome_completo": context.user_data.get("nome_completo", ""),
         "email":         context.user_data.get("email", ""),
         "telefone":      context.user_data.get("telefone", ""),
         "linkedin":      context.user_data.get("linkedin", ""),
         "cidade":        context.user_data.get("cidade", ""),
-        "idioma":        update.message.text.strip(),
+        "idioma":        context.user_data.get("idioma", ""),
+        "cargo_alvo":    cargo_alvo,
+        "senioridade":   senioridade,
     })
     context.user_data.clear()
 
-    await update.message.reply_text(
-        "Perfil salvo!\n\n"
-        "Agora envie um arquivo .txt ou .pdf com seu historico profissional.\n"
-        "O sistema vai estruturar o seu perfil automaticamente.\n\n"
-        "Depois, envie uma vaga ou link do LinkedIn para gerar o curriculo,\n"
-        "ou use /testar_vagas para buscar vagas agora."
+    await query.edit_message_text(
+        f"Perfil salvo.\n"
+        f"Objetivo: {cargo_alvo} ({senioridade})\n\n"
+        "Agora envie um arquivo .pdf ou .txt com seu historico profissional base."
     )
     return ConversationHandler.END
 
-
 # =========================================================
-# HELPER — PERGUNTA O TIPO DE CV (inline keyboard)
+# PIPELINE: GERA CV + ENVIA PDF
 # =========================================================
-async def _perguntar_tipo_cv(update_or_query, context: ContextTypes.DEFAULT_TYPE,
-                              vaga_dados: dict):
-    """
-    Salva os dados da vaga em context.user_data e exibe o teclado
-    'Com Resumo' / 'Sem Resumo'. Funciona tanto para Update quanto para CallbackQuery.
-    """
+async def _perguntar_tipo_cv(update_or_query, context: ContextTypes.DEFAULT_TYPE, vaga_dados: dict):
     context.user_data["vaga_pendente"] = vaga_dados
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📝 Com Resumo",  callback_data="cv_com_resumo"),
-            InlineKeyboardButton("⚡ Sem Resumo", callback_data="cv_sem_resumo"),
-        ]
+        [InlineKeyboardButton("Com Resumo", callback_data="cv_com_resumo"),
+         InlineKeyboardButton("Sem Resumo", callback_data="cv_sem_resumo")]
     ])
     msg = "Como voce quer o curriculo gerado?"
     if hasattr(update_or_query, "message") and update_or_query.message:
@@ -1160,15 +697,11 @@ async def _perguntar_tipo_cv(update_or_query, context: ContextTypes.DEFAULT_TYPE
     else:
         await update_or_query.reply_text(msg, reply_markup=keyboard)
 
-
 async def callback_tipo_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa o clique em 'Com Resumo' ou 'Sem Resumo'."""
     query = update.callback_query
     await query.answer()
-
     com_resumo = query.data == "cv_com_resumo"
-    vaga       = context.user_data.pop("vaga_pendente", None)
-
+    vaga = context.user_data.pop("vaga_pendente", None)
     if not vaga:
         await query.edit_message_text("Sessao expirada. Envie a vaga novamente.")
         return
@@ -1176,93 +709,192 @@ async def callback_tipo_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     usuario = buscar_usuario(user_id)
     perfil  = (usuario or {}).get("perfil_estruturado") or {}
-
     tipo_txt = "com resumo" if com_resumo else "sem resumo"
     await query.edit_message_text(f"Gerando curriculo ATS {tipo_txt}... Aguarde.")
 
     try:
         await processar_e_enviar_vaga(
-            bot=context.bot,
-            telegram_id=user_id,
-            usuario=usuario,
-            perfil=perfil,
+            bot=context.bot, telegram_id=user_id, usuario=usuario, perfil=perfil,
             titulo=vaga.get("titulo", vaga.get("title", "")),
             empresa=vaga.get("empresa", vaga.get("company", "")),
             local=vaga.get("localizacao", vaga.get("location", "")),
             descricao=vaga.get("descricao", vaga.get("description", "")),
             url=vaga.get("url", vaga.get("job_url", "")),
-            com_resumo=com_resumo,
-            context=context,
+            com_resumo=com_resumo, context=context,
         )
         await query.delete_message()
     except Exception as e:
         logger.error(f"[TipoCV] {e}", exc_info=True)
         await query.edit_message_text(f"Erro ao gerar curriculo: {e}")
 
+async def processar_e_enviar_vaga(
+    bot, telegram_id: str, usuario: dict, perfil: dict,
+    titulo: str, empresa: str, local: str, descricao: str,
+    url: str = "", job_hash: str = "", indice: int = 1,
+    com_resumo: bool = True, context: ContextTypes.DEFAULT_TYPE = None,
+):
+    cv = gerar_cv_json(perfil, usuario, titulo, empresa, local, descricao, com_resumo)
+    pdf_buf = gerar_pdf(cv)
+
+    if context is not None:
+        context.user_data["ultimo_cv"] = cv
+        context.user_data["ultimo_usuario"] = usuario
+
+    nome_usuario = usuario.get("nome_completo", "Candidato")
+    nome_vaga    = titulo or empresa or "Vaga"
+    def _slug(s: str) -> str: return re.sub(r"[^\w\-]", "_", s.strip())[:40]
+    nome_arquivo = f"{_slug(nome_usuario)}_{_slug(nome_vaga)}.pdf"
+
+    caption = f"Vaga {indice}: {titulo}\nEmpresa: {empresa}\nLocal: {local}"
+    if url and url not in ("nan", ""): caption += f"\nLink: {url}"
+
+    await bot.send_document(chat_id=telegram_id, document=pdf_buf, filename=nome_arquivo, caption=caption)
+
+    rel = cv.get("relatorio_analitico", {})
+    if rel:
+        score = rel.get("match_score", "?")
+        gaps  = rel.get("analise_gaps", [])
+        dica  = rel.get("dica_entrevista", "")
+        linhas = [f"Relatorio ATS — Vaga {indice}", f"Match Score: {score}/100"]
+        if gaps:
+            linhas.append("\nGaps identificados:")
+            linhas += [f"- {g}" for g in gaps]
+        if dica: linhas.append(f"\nDica para entrevista:\n{dica}")
+        linhas.append("\nPara editar o curriculo gerado, use /editar_cv + descricao da alteracao.")
+        await bot.send_message(chat_id=telegram_id, text="\n".join(linhas))
+
+    if job_hash: registrar_job_enviado(telegram_id, job_hash, titulo, empresa)
 
 # =========================================================
-# COMANDO /editar_cv — edita o ultimo curriculo gerado
+# JOB DIARIO E ROTINAS DE SCRAPING (UX C)
+# =========================================================
+async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("[Scheduler] Iniciando sugestoes diarias...")
+    usuarios = buscar_todos_usuarios()
+    for usuario in usuarios:
+        telegram_id = usuario.get("telegram_id")
+        perfil      = usuario.get("perfil_estruturado") or {}
+        cidade      = usuario.get("cidade", "Brazil")
+        if not telegram_id or not perfil: continue
+
+        cargo_alvo = usuario.get("cargo_alvo", "Profissional")
+        senioridade = usuario.get("senioridade", "")
+        termo_busca = f"{cargo_alvo} {senioridade}".strip()
+        ingles_fluente = perfil_tem_ingles_fluente(perfil)
+
+        try:
+            vagas = buscar_vagas_jobspy(
+                cargo=termo_busca, keywords="", cidade=cidade, quantidade=10,
+                buscar_remoto=True, ingles_fluente=ingles_fluente,
+            )
+            if not vagas: continue
+
+            melhores = selecionar_melhores_vagas(perfil, vagas, senioridade)
+            novas = [v for v in melhores if not job_ja_enviado(telegram_id, gerar_hash_vaga(v))]
+            if not novas: continue
+
+            await context.bot.send_message(chat_id=telegram_id, text=f"Bom dia! Suas {len(novas)} sugestao(es) de hoje com curriculo adaptado:")
+            for i, vaga in enumerate(novas, 1):
+                try:
+                    await processar_e_enviar_vaga(
+                        bot=context.bot, telegram_id=telegram_id, usuario=usuario, perfil=perfil,
+                        titulo=vaga.get("title",""), empresa=vaga.get("company",""), local=vaga.get("location",""),
+                        descricao=vaga.get("description",""), url=vaga.get("job_url",""),
+                        job_hash=gerar_hash_vaga(vaga), indice=i,
+                    )
+                except Exception as e:
+                    logger.error(f"[Scheduler] Erro vaga {i}: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"[Scheduler] Erro user {telegram_id}: {e}", exc_info=True)
+
+async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer()
+        user_id = str(update.callback_query.from_user.id)
+        status_msg = await update.callback_query.edit_message_text("Iniciando varredura no LinkedIn e Indeed...")
+    else:
+        user_id = str(update.effective_user.id)
+        status_msg = await update.message.reply_text("Iniciando varredura no LinkedIn e Indeed...")
+
+    usuario = buscar_usuario(user_id)
+    perfil  = usuario.get("perfil_estruturado") if usuario else None
+
+    if not perfil:
+        await status_msg.edit_text("Voce ainda nao tem perfil estruturado. Envie um historico profissional base primeiro.")
+        return
+
+    cidade = usuario.get("cidade", "Brazil")
+    cargo_alvo = usuario.get("cargo_alvo", "Profissional")
+    senioridade = usuario.get("senioridade", "")
+    termo_busca = f"{cargo_alvo} {senioridade}".strip()
+    ingles_fluente = perfil_tem_ingles_fluente(perfil)
+
+    vagas = buscar_vagas_jobspy(
+        cargo=termo_busca, keywords="", cidade=cidade, quantidade=10,
+        buscar_remoto=True, ingles_fluente=ingles_fluente,
+    )
+
+    if not vagas:
+        await status_msg.edit_text("Nenhuma vaga encontrada agora. Tente novamente mais tarde.")
+        return
+
+    await status_msg.edit_text("Vagas encontradas. Avaliando aderencia tecnica com IA...")
+    melhores = selecionar_melhores_vagas(perfil, vagas, senioridade)
+    novas = [v for v in melhores if not job_ja_enviado(user_id, gerar_hash_vaga(v))]
+
+    if not novas:
+        await status_msg.edit_text("As vagas encontradas possuem baixa aderencia ao seu historico ou ja foram enviadas.")
+        return
+
+    await status_msg.edit_text(f"Match concluido. Gerando {len(novas)} curriculo(s) adaptado(s) em PDF...")
+    for i, vaga in enumerate(novas, 1):
+        try:
+            await processar_e_enviar_vaga(
+                bot=context.bot, telegram_id=user_id, usuario=usuario, perfil=perfil,
+                titulo=vaga.get("title",""), empresa=vaga.get("company",""), local=vaga.get("location",""),
+                descricao=vaga.get("description",""), url=vaga.get("job_url",""),
+                job_hash=gerar_hash_vaga(vaga), indice=i,
+            )
+        except Exception as e:
+            logger.error(f"[Teste] Erro vaga {i}: {e}", exc_info=True)
+            await context.bot.send_message(chat_id=user_id, text=f"Erro ao processar vaga {i}: {e}")
+    await status_msg.delete()
+
+# =========================================================
+# COMANDOS ADICIONAIS E HANDLER DE ENTRADA
 # =========================================================
 async def cmd_editar_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Uso: /editar_cv Mude meu titulo para Senior Data Scientist
-         /editar_cv Remova o projeto X
-         /editar_cv Adicione SQL nas competencias
-    """
     user_id = str(update.effective_user.id)
     cv_atual = context.user_data.get("ultimo_cv")
     usuario  = context.user_data.get("ultimo_usuario") or buscar_usuario(user_id)
 
     if not cv_atual:
-        await update.message.reply_text(
-            "Nenhum curriculo gerado nesta sessao.\n"
-            "Envie uma vaga para gerar um curriculo primeiro."
-        )
+        await update.message.reply_text("Nenhum curriculo gerado nesta sessao.")
         return
 
-    # Instrucao vem apos o comando: /editar_cv <instrucao>
-    partes     = update.message.text.split(maxsplit=1)
-    instrucao  = partes[1].strip() if len(partes) > 1 else ""
-
+    partes = update.message.text.split(maxsplit=1)
+    instrucao = partes[1].strip() if len(partes) > 1 else ""
     if not instrucao:
-        await update.message.reply_text(
-            "Informe o que editar apos o comando.\n"
-            "Exemplos:\n"
-            "/editar_cv Mude meu titulo para Senior Data Scientist\n"
-            "/editar_cv Remova o projeto X\n"
-            "/editar_cv Adicione Spark nas competencias"
-        )
+        await update.message.reply_text("Informe o que editar apos o comando. Ex: /editar_cv Mude meu titulo")
         return
 
     status = await update.message.reply_text("Aplicando edicao no curriculo... Aguarde.")
     try:
-        cv_novo  = editar_cv_json(cv_atual, instrucao)
-        pdf_buf  = gerar_pdf(cv_novo)
-
-        # Atualiza CV armazenado
+        cv_novo = editar_cv_json(cv_atual, instrucao)
+        pdf_buf = gerar_pdf(cv_novo)
         context.user_data["ultimo_cv"] = cv_novo
 
         nome_usuario = (usuario or {}).get("nome_completo", "Candidato")
         titulo_cv    = cv_novo.get("identificacao", {}).get("titulo", "Curriculo")
-        def _slug(s: str) -> str:
-            return re.sub(r"[^\w\-]", "_", s.strip())[:40]
+        def _slug(s: str) -> str: return re.sub(r"[^\w\-]", "_", s.strip())[:40]
         nome_arquivo = f"{_slug(nome_usuario)}_{_slug(titulo_cv)}_editado.pdf"
 
-        await context.bot.send_document(
-            chat_id=user_id,
-            document=pdf_buf,
-            filename=nome_arquivo,
-            caption=f"Curriculo atualizado: {instrucao}",
-        )
+        await context.bot.send_document(chat_id=user_id, document=pdf_buf, filename=nome_arquivo, caption=f"Curriculo atualizado: {instrucao}")
         await status.delete()
     except Exception as e:
         logger.error(f"[EditarCV] {e}", exc_info=True)
         await status.edit_text(f"Erro ao aplicar edicao: {e}")
 
-
-# =========================================================
-# HANDLER PRINCIPAL — TEXTO, ARQUIVO E URL LINKEDIN
-# =========================================================
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     usuario = buscar_usuario(user_id)
@@ -1271,18 +903,15 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use /start para configurar seu perfil primeiro.")
         return
 
-    # --- Extrai texto ---
     try:
         if update.message.document:
             doc  = update.message.document
             file = await context.bot.get_file(doc.file_id)
-            buf  = await file.download_as_bytearray()          # API atual: retorna bytearray
+            buf  = await file.download_as_bytearray()
             texto = extrair_texto_arquivo(bytearray(buf), doc.file_name)
-            logger.info(f"[Input] Arquivo '{doc.file_name}' de user={user_id}")
             eh_arquivo = True
         else:
             texto = update.message.text.strip()
-            logger.info(f"[Input] Texto de user={user_id}: {texto[:60]}")
             eh_arquivo = False
     except Exception as e:
         logger.error(f"[Input] {e}")
@@ -1294,39 +923,21 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     intencao = classificar_intencao(texto)
-    logger.info(f"[Input] Intencao: {intencao} para user={user_id}")
     perfil = usuario.get("perfil_estruturado") or {}
 
-    # ============================
-    # OUTRO — mensagem nao reconhecida
-    # ============================
     if intencao == "OUTRO" and not eh_arquivo:
-        nome = usuario.get("nome_completo", update.effective_user.first_name or "")
-        await update.message.reply_text(
-            f"Ola, {nome}! Nao reconheci uma vaga ou historico profissional. 🤔\n"
-            "Selecione uma das opcoes abaixo para continuar:"
-        )
-        await _enviar_menu(update)
+        await _enviar_menu(update, context)
         return
 
-    # ============================
-    # EDICAO — edita perfil por texto
-    # ============================
     if intencao == "EDICAO" and not eh_arquivo:
         if not perfil:
-            await update.message.reply_text(
-                "Voce ainda nao tem historico salvo.\n"
-                "Envie primeiro um .pdf ou .txt com seu curriculo."
-            )
+            await update.message.reply_text("Voce ainda nao tem historico salvo.")
             return
         status = await update.message.reply_text("Aplicando edicao no seu perfil... Aguarde.")
         try:
             novo_perfil = editar_perfil_llm(perfil, texto)
             atualizar_perfil_estruturado(user_id, novo_perfil)
-            await status.edit_text(
-                "Perfil atualizado! ✅\n\n"
-                "Use /meuperfil para conferir as alteracoes."
-            )
+            await status.edit_text("Perfil atualizado. Use /meuperfil para conferir as alteracoes.")
         except Exception as e:
             logger.error(f"[Edicao] {e}", exc_info=True)
             await status.edit_text("Erro ao aplicar edicao. Tente novamente.")
@@ -1334,65 +945,39 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = await update.message.reply_text("Processando... Aguarde.")
 
-    # ============================
-    # HISTORICO — Consolida perfil
-    # ============================
     if intencao == "HISTORICO":
         await status.edit_text("Extraindo e estruturando seu perfil com IA...")
         try:
             novo_perfil = consolidar_perfil(perfil, texto)
             atualizar_perfil_estruturado(user_id, novo_perfil)
-            nome = usuario.get("nome_completo", update.effective_user.first_name or "")
             await status.edit_text(
-                "Perfil atualizado com sucesso! ✅\n\n"
-                "Agora voce pode:\n"
-                "- Colar a descricao de uma vaga para gerar o curriculo\n"
-                "- Colar um link do LinkedIn\n"
-                "- Usar /testar_vagas para buscar vagas agora\n"
-                "- Aguardar as sugestoes automaticas do meio-dia\n\n"
-                "Use /meuperfil para ver o historico salvo."
+                "Perfil atualizado com sucesso.\n\n"
+                "Agora voce pode colar a descricao de uma vaga ou link do LinkedIn para gerar o curriculo, "
+                "ou usar os comandos do menu para buscar vagas."
             )
         except Exception as e:
             logger.error(f"[Historico] {e}", exc_info=True)
             await status.edit_text("Erro ao estruturar perfil. Tente novamente.")
         return
 
-    # ============================
-    # URL LINKEDIN — Extrai a vaga
-    # ============================
     if intencao == "URL_LINKEDIN":
         if not perfil:
-            await status.edit_text(
-                "Voce ainda nao tem historico salvo.\n"
-                "Envie primeiro um .txt ou .pdf com seu historico."
-            )
+            await status.edit_text("Voce ainda nao tem historico salvo. Envie seu curriculo base primeiro.")
             return
-
         await status.edit_text("Extraindo dados da vaga no LinkedIn...")
         urls = re.findall(r"https?://[^\s]+linkedin\.com/jobs[^\s]*", texto, re.IGNORECASE)
         url  = urls[0] if urls else texto.strip()
 
         resultado = extrair_vaga_linkedin(url, db_client)
         if not resultado.get("sucesso"):
-            await status.edit_text(
-                f"Nao consegui extrair a vaga: {resultado.get('erro','')}\n\n"
-                "Cole a descricao completa da vaga como texto e tente novamente."
-            )
+            await status.edit_text("Nao consegui extrair a vaga. Cole a descricao completa como texto.")
             return
-
-        vaga_dados = resultado["dados"]
         await status.delete()
-        await _perguntar_tipo_cv(update, context, vaga_dados)
+        await _perguntar_tipo_cv(update, context, resultado["dados"])
         return
 
-    # ============================
-    # VAGA (texto livre)
-    # ============================
     if not perfil:
-        await status.edit_text(
-            "Voce ainda nao tem historico salvo.\n"
-            "Envie primeiro um .txt ou .pdf com seu historico."
-        )
+        await status.edit_text("Voce ainda nao tem historico salvo. Envie seu curriculo base primeiro.")
         return
 
     await status.delete()
@@ -1400,79 +985,36 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "titulo": "", "empresa": "", "localizacao": "", "descricao": texto, "url": "",
     })
 
+async def cmd_meu_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query: await update.callback_query.answer()
+    user_id = update.effective_user.id if update.message else update.callback_query.from_user.id
+    usuario = buscar_usuario(user_id)
+    if not usuario or not usuario.get("email"):
+        await context.bot.send_message(chat_id=user_id, text="Use /start para configurar seu perfil primeiro.")
+        return
+    perfil = usuario.get("perfil_estruturado") or {}
+    texto = formatar_perfil_texto(usuario, perfil)
+    for i in range(0, len(texto), 4000):
+        await context.bot.send_message(chat_id=user_id, text=texto[i:i+4000])
+
+async def cmd_deletar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query: await update.callback_query.answer()
+    user_id = str(update.effective_user.id if update.message else update.callback_query.from_user.id)
+    try:
+        db_client.table("sent_jobs").delete().eq("telegram_id", user_id).execute()
+        db_client.table("user_profiles").delete().eq("telegram_id", user_id).execute()
+        await context.bot.send_message(chat_id=user_id, text="Todos os seus dados foram removidos.")
+    except Exception as e:
+        logger.error(f"[Deletar] {e}", exc_info=True)
+        await context.bot.send_message(chat_id=user_id, text="Erro ao remover dados.")
 
 async def handle_erro(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"[Erro Global] {context.error}", exc_info=context.error)
 
-
 # =========================================================
-# MENU PADRAO — reutilizado em cmd_start, OUTRO, etc.
-# =========================================================
-async def _enviar_menu(update: Update, nome: str = ""):
-    saudacao = f"Olá, {nome}! " if nome else ""
-    await update.message.reply_text(
-        f"{saudacao}Perfil ativo. ✅\n\n"
-        "📋 <b>Comandos disponíveis:</b>\n"
-        "/meuperfil — Visualize e edite o histórico salvo\n"
-        "/testar_vagas — Busca vagas agora e gera currículos\n"
-        "/editar_cv [instrucao] — Edita o último currículo gerado\n"
-        "/deletar — Remova todos os seus dados\n\n"
-        "Para <b>atualizar o perfil</b>, envie currículo (.pdf/.txt) ou texto livre.\n"
-        "Para <b>gerar currículo ATS</b>, envie a descrição ou link de uma vaga.",
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# COMANDO /meuperfil
-# =========================================================
-async def cmd_meu_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    usuario = buscar_usuario(user_id)
-
-    if not usuario or not usuario.get("email"):
-        await update.message.reply_text("Use /start para configurar seu perfil primeiro.")
-        return
-
-    perfil = usuario.get("perfil_estruturado") or {}
-
-    if not perfil:
-        await update.message.reply_text(
-            "Voce ainda nao tem historico salvo.\n"
-            "Envie um arquivo .pdf ou .txt com seu curriculo para comecar."
-        )
-        return
-
-    texto = formatar_perfil_texto(usuario, perfil)
-    # Telegram tem limite de 4096 chars por mensagem — envia em blocos sem parse_mode
-    # para evitar crash com caracteres especiais nos dados do usuario
-    for i in range(0, len(texto), 4000):
-        await update.message.reply_text(texto[i:i+4000])
-
-
-# =========================================================
-# COMANDO /deletar
-# =========================================================
-async def cmd_deletar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    try:
-        db_client.table("sent_jobs").delete().eq("telegram_id", user_id).execute()
-        db_client.table("user_profiles").delete().eq("telegram_id", user_id).execute()
-        await update.message.reply_text(
-            "Todos os seus dados foram removidos. Use /start para comecar novamente."
-        )
-    except Exception as e:
-        logger.error(f"[Deletar] {e}", exc_info=True)
-        await update.message.reply_text("Erro ao remover dados. Tente novamente.")
-
-# =========================================================
-# MAIN
+# INIT
 # =========================================================
 def main():
-    logger.info("=" * 60)
-    logger.info("ATS Resume Bot — Versao Definitiva")
-    logger.info("=" * 60)
-
     threading.Thread(target=start_health_server, daemon=True).start()
 
     app = (
@@ -1482,25 +1024,20 @@ def main():
         .build()
     )
 
-    # Agendamento diario — 12:00 Brasilia
     BRASILIA = ZoneInfo("America/Sao_Paulo")
-    app.job_queue.run_daily(
-        enviar_sugestoes_diarias,
-        time=dtime(hour=12, minute=0, second=0, tzinfo=BRASILIA),
-        name="sugestoes_diarias",
-    )
-    logger.info("[Scheduler] Job agendado: 12:00 Brasilia")
+    app.job_queue.run_daily(enviar_sugestoes_diarias, time=dtime(hour=12, minute=0, second=0, tzinfo=BRASILIA))
 
-    # Onboarding: ASK_NOME(0) -> ASK_EMAIL(1) -> ASK_PHONE(2) -> ASK_LINKEDIN(3) -> ASK_CITY(4) -> ASK_LANGUAGE(5)
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
-            ASK_NOME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_nome)],
-            ASK_EMAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_email)],
-            ASK_PHONE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
-            ASK_LINKEDIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_linkedin)],
-            ASK_CITY:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_city)],
-            ASK_LANGUAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_language)],
+            ASK_NOME:        [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_nome)],
+            ASK_EMAIL:       [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_email)],
+            ASK_PHONE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
+            ASK_LINKEDIN:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_linkedin)],
+            ASK_CITY:        [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_city)],
+            ASK_LANGUAGE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_language)],
+            ASK_TARGET_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_target_role)],
+            ASK_SENIORITY:   [CallbackQueryHandler(callback_seniority, pattern="^sen_")],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
     )
@@ -1511,14 +1048,11 @@ def main():
     app.add_handler(CommandHandler("deletar",      cmd_deletar))
     app.add_handler(CommandHandler("editar_cv",    cmd_editar_cv))
     app.add_handler(CallbackQueryHandler(callback_tipo_cv, pattern="^cv_(com|sem)_resumo$"))
-    app.add_handler(
-        MessageHandler(filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), handle_input)
-    )
+    app.add_handler(CallbackQueryHandler(callback_menu, pattern="^menu_"))
+    app.add_handler(MessageHandler(filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), handle_input))
     app.add_error_handler(handle_erro)
 
-    logger.info("Bot em modo de escuta (polling)...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
