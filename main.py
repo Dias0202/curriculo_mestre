@@ -10,6 +10,7 @@ import json
 import logging
 import hashlib
 import threading
+import asyncio
 import fitz  # PyMuPDF
 from datetime import time as dtime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -173,7 +174,7 @@ class CurriculoHarvard(FPDF):
             desc_emp  = exp.get("descricao_empresa", "")
 
             self.set_font("helvetica", "B", 11)
-            self.cell(0, 6, sanitize(f"{cargo}  —  {empresa}"), new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 6, sanitize(f"{cargo}  -  {empresa}"), new_x="LMARGIN", new_y="NEXT")
 
             meta = f"{inicio} - {fim}"
             if local_exp: meta += f"  |  {local_exp}"
@@ -446,15 +447,21 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) 
         for i, v in enumerate(vagas)
     ])
 
+    regra_eliminacao = (
+        "- REGRA DE ELIMINACAO (Score 0): Se a vaga exige nivel Senior/Pleno e o candidato e Junior/Estagio (ou vice-versa), o score DEVE ser 0. Nao prossiga com a avaliacao tecnologica.\n"
+        if senioridade_alvo else 
+        "- Avalie a vaga puramente pelas habilidades tecnicas, pois a senioridade do candidato nao esta definida.\n"
+    )
+
     raw = _chat(
         system="Voce e um recrutador tecnico senior. Retorne SOMENTE JSON valido.",
         prompt=(
-            f"Avalie a aderencia de cada vaga ao perfil do candidato, que busca vagas de nivel: {senioridade_alvo}.\n\n"
+            f"Avalie a aderencia de cada vaga ao perfil do candidato. Senioridade alvo: {senioridade_alvo or 'Nao definida'}.\n\n"
             "REGRAS DE PONTUACAO ESTUDADA (0 a 100):\n"
-            "- REGRA DE ELIMINACAO (Score 0): Se a vaga exige nivel Senior/Pleno e o candidato e Junior/Estagio (ou vice-versa), o score DEVE ser 0. Nao prossiga com a avaliacao tecnologica.\n"
-            "- 80-100: Senioridade exata, cargo exato, dominio de mais de 80% do stack tecnologico.\n"
-            "- 60-79: Senioridade compativel, cargo relacionado, dominio de tecnologias core.\n"
-            "- 0-59: Faltam requisitos fundamentais ou a senioridade diverge totalmente.\n\n"
+            f"{regra_eliminacao}"
+            "- 80-100: Cargo exato, dominio de mais de 80% do stack tecnologico.\n"
+            "- 60-79: Cargo relacionado, dominio de tecnologias core.\n"
+            "- 0-59: Faltam requisitos fundamentais.\n\n"
             "IMPORTANTE: use numeros INTEIROS de 0 a 100.\n"
             'Retorne APENAS este JSON:\n'
             '{"scores": [{"indice": 0, "score": 75, "motivo": "justificativa"}, ...]}\n\n'
@@ -565,7 +572,7 @@ def gerar_hash_vaga(vaga: dict) -> str:
     return hashlib.md5(chave.encode()).hexdigest()
 
 # =========================================================
-# MENUS E CONTROLES DE FLUXO (UX D)
+# MENUS E CONTROLES DE FLUXO
 # =========================================================
 async def _enviar_menu(update: Update, context: ContextTypes.DEFAULT_TYPE = None, nome: str = ""):
     keyboard = InlineKeyboardMarkup([
@@ -594,7 +601,7 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_deletar(update, context)
 
 # =========================================================
-# ONBOARDING (UX B)
+# ONBOARDING E ATUALIZACAO DE OBJETIVO
 # =========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -605,11 +612,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "Bem-vindo ao ATS Resume Bot!\n\n"
+        "Bem-vindo ao ATS Resume Bot.\n\n"
         "Vou configurar seu perfil em poucos passos.\n\n"
         "Qual o seu NOME COMPLETO?"
     )
     return ASK_NOME
+
+async def cmd_atualizar_objetivo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+        msg = update.callback_query.message
+    else:
+        msg = update.message
+
+    await msg.reply_text(
+        "Atualizacao de Perfil necessaria.\n\n"
+        "Qual o cargo exato que voce busca?\n"
+        "Exemplos: Desenvolvedor Python, Analista de Dados, Engenheiro DevOps"
+    )
+    return ASK_TARGET_ROLE
 
 async def ask_nome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["nome_completo"] = update.message.text.strip()
@@ -755,7 +776,7 @@ async def processar_e_enviar_vaga(
         score = rel.get("match_score", "?")
         gaps  = rel.get("analise_gaps", [])
         dica  = rel.get("dica_entrevista", "")
-        linhas = [f"Relatorio ATS — Vaga {indice}", f"Match Score: {score}/100"]
+        linhas = [f"Relatorio ATS - Vaga {indice}", f"Match Score: {score}/100"]
         if gaps:
             linhas.append("\nGaps identificados:")
             linhas += [f"- {g}" for g in gaps]
@@ -766,7 +787,7 @@ async def processar_e_enviar_vaga(
     if job_hash: registrar_job_enviado(telegram_id, job_hash, titulo, empresa)
 
 # =========================================================
-# JOB DIARIO E ROTINAS DE SCRAPING (UX C)
+# JOB DIARIO E ROTINAS DE SCRAPING
 # =========================================================
 async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
     logger.info("[Scheduler] Iniciando sugestoes diarias...")
@@ -777,9 +798,14 @@ async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
         cidade      = usuario.get("cidade", "Brazil")
         if not telegram_id or not perfil: continue
 
-        cargo_alvo = usuario.get("cargo_alvo", "Profissional")
+        cargo_alvo = usuario.get("cargo_alvo", "")
         senioridade = usuario.get("senioridade", "")
         termo_busca = f"{cargo_alvo} {senioridade}".strip()
+        
+        if not termo_busca:
+            logger.info(f"[Scheduler] Usuario {telegram_id} sem cargo/senioridade. Pulando.")
+            continue
+
         ingles_fluente = perfil_tem_ingles_fluente(perfil)
 
         try:
@@ -824,7 +850,7 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cidade = usuario.get("cidade", "Brazil")
-    cargo_alvo = usuario.get("cargo_alvo", "Profissional")
+    cargo_alvo = usuario.get("cargo_alvo", "")
     senioridade = usuario.get("senioridade", "")
     termo_busca = f"{cargo_alvo} {senioridade}".strip()
     ingles_fluente = perfil_tem_ingles_fluente(perfil)
@@ -859,6 +885,45 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"[Teste] Erro vaga {i}: {e}", exc_info=True)
             await context.bot.send_message(chat_id=user_id, text=f"Erro ao processar vaga {i}: {e}")
     await status_msg.delete()
+
+# =========================================================
+# BROADCAST - NOTIFICAR PERFIS INCOMPLETOS
+# =========================================================
+async def cmd_notificar_pendentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Iniciando varredura de perfis incompletos...")
+    usuarios = buscar_todos_usuarios()
+    notificados = 0
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Atualizar Objetivo Agora", callback_data="menu_atualizar_objetivo")]
+    ])
+
+    for u in usuarios:
+        cargo = u.get("cargo_alvo")
+        sen = u.get("senioridade")
+        
+        if not cargo or not sen:
+            telegram_id = u.get("telegram_id")
+            if not telegram_id: continue
+                
+            try:
+                await context.bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        "Atencao: Atualizamos nosso motor de inteligencia artificial para "
+                        "garantir vagas muito mais precisas.\n\n"
+                        "Notamos que o seu perfil esta sem o Cargo Alvo e a Senioridade definidos. "
+                        "Sem isso, voce deixara de receber as sugestoes diarias.\n\n"
+                        "Clique no botao abaixo para atualizar:"
+                    ),
+                    reply_markup=keyboard
+                )
+                notificados += 1
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"[Broadcast] Erro ao notificar {telegram_id}: {e}")
+
+    await update.message.reply_text(f"Varredura concluida. {notificados} usuarios notificados.")
 
 # =========================================================
 # COMANDOS ADICIONAIS E HANDLER DE ENTRADA
@@ -1028,7 +1093,10 @@ def main():
     app.job_queue.run_daily(enviar_sugestoes_diarias, time=dtime(hour=12, minute=0, second=0, tzinfo=BRASILIA))
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start)],
+        entry_points=[
+            CommandHandler("start", cmd_start),
+            CallbackQueryHandler(cmd_atualizar_objetivo, pattern="^menu_atualizar_objetivo$")
+        ],
         states={
             ASK_NOME:        [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_nome)],
             ASK_EMAIL:       [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_email)],
@@ -1043,6 +1111,7 @@ def main():
     )
 
     app.add_handler(conv)
+    app.add_handler(CommandHandler("notificar_pendentes", cmd_notificar_pendentes))
     app.add_handler(CommandHandler("testar_vagas", cmd_testar_vagas))
     app.add_handler(CommandHandler("meuperfil",    cmd_meu_perfil))
     app.add_handler(CommandHandler("deletar",      cmd_deletar))
