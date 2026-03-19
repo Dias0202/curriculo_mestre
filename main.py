@@ -59,7 +59,7 @@ llm_client: Groq   = Groq(api_key=GROQ_API_KEY)
 db_client:  Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =========================================================
-# KEEP-ALIVE — Render.com health check
+# KEEP-ALIVE
 # =========================================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -108,7 +108,7 @@ def extrair_texto_arquivo(file_bytes: bytearray, filename: str) -> str:
     return file_bytes.decode("utf-8", errors="ignore")
 
 # =========================================================
-# GERADOR DE PDF (Padrao Harvard)
+# GERADOR DE PDF (Padrao Harvard com Type Checking)
 # =========================================================
 class CurriculoHarvard(FPDF):
     def __init__(self):
@@ -134,6 +134,12 @@ class CurriculoHarvard(FPDF):
         self.set_font("helvetica", "", 10)
         self.multi_cell(0, 5, sanitize(f"{prefixo} {txt}"), new_x="LMARGIN", new_y="NEXT")
 
+    def _flatten_item(self, item) -> str:
+        """Processa dicionarios injetados por alucinacao na estrutura de arrays de string"""
+        if isinstance(item, dict):
+            return " - ".join([str(v) for v in item.values() if v])
+        return str(item)
+
     def bloco_cabecalho(self, ident: dict):
         nome   = ident.get("nome", "")
         titulo = ident.get("titulo", "")
@@ -157,7 +163,7 @@ class CurriculoHarvard(FPDF):
     def bloco_competencias(self, titulo: str, lista: list):
         if not lista: return
         self._secao(titulo)
-        itens = [sanitize(str(i)) for i in lista if i]
+        itens = [sanitize(self._flatten_item(i)) for i in lista if i]
         self.set_font("helvetica", "", 10)
         self.multi_cell(0, 5, "  |  ".join(itens), new_x="LMARGIN", new_y="NEXT")
 
@@ -166,12 +172,12 @@ class CurriculoHarvard(FPDF):
         self._secao(titulo)
         for exp in exps:
             if not isinstance(exp, dict): continue
-            cargo     = exp.get("cargo", "")
-            empresa   = exp.get("empresa", "")
-            local_exp = exp.get("localizacao", "")
-            inicio    = exp.get("data_inicio", "")
-            fim       = exp.get("data_fim", "")
-            desc_emp  = exp.get("descricao_empresa", "")
+            cargo     = str(exp.get("cargo", ""))
+            empresa   = str(exp.get("empresa", ""))
+            local_exp = str(exp.get("localizacao", ""))
+            inicio    = str(exp.get("data_inicio", ""))
+            fim       = str(exp.get("data_fim", ""))
+            desc_emp  = str(exp.get("descricao_empresa", ""))
 
             self.set_font("helvetica", "B", 11)
             self.cell(0, 6, sanitize(f"{cargo}  -  {empresa}"), new_x="LMARGIN", new_y="NEXT")
@@ -181,7 +187,7 @@ class CurriculoHarvard(FPDF):
             self.set_font("helvetica", "I", 9)
             self.cell(0, 5, sanitize(meta), new_x="LMARGIN", new_y="NEXT")
 
-            if desc_emp:
+            if desc_emp and desc_emp.lower() != "none":
                 self.set_font("helvetica", "I", 9)
                 self.multi_cell(0, 4, sanitize(desc_emp), new_x="LMARGIN", new_y="NEXT")
             self.ln(1)
@@ -189,14 +195,16 @@ class CurriculoHarvard(FPDF):
             resps = exp.get("responsabilidades", [])
             if isinstance(resps, str): resps = [resps]
             for r in resps:
-                if r: self._bullet(r, "-")
+                val = self._flatten_item(r)
+                if val: self._bullet(val, "-")
 
             conquistas = exp.get("conquistas", [])
             if isinstance(conquistas, str): conquistas = [conquistas]
             for c in conquistas:
-                if c:
+                val = self._flatten_item(c)
+                if val:
                     self.set_font("helvetica", "B", 10)
-                    self.multi_cell(0, 5, sanitize(f">> {c}"), new_x="LMARGIN", new_y="NEXT")
+                    self.multi_cell(0, 5, sanitize(f">> {val}"), new_x="LMARGIN", new_y="NEXT")
             self.ln(3)
 
     def bloco_educacao(self, titulo: str, edus: list):
@@ -204,11 +212,11 @@ class CurriculoHarvard(FPDF):
         self._secao(titulo)
         for edu in edus:
             if not isinstance(edu, dict): continue
-            grau  = edu.get("grau", "")
-            curso = edu.get("curso", "")
-            inst  = edu.get("instituicao", "")
-            ini   = edu.get("ano_inicio", "")
-            fim   = edu.get("ano_fim", "")
+            grau  = str(edu.get("grau", ""))
+            curso = str(edu.get("curso", ""))
+            inst  = str(edu.get("instituicao", ""))
+            ini   = str(edu.get("ano_inicio", ""))
+            fim   = str(edu.get("ano_fim", ""))
             cabecalho = f"{grau} em {curso}" if grau else curso
             self.set_font("helvetica", "B", 11)
             self.cell(0, 6, sanitize(cabecalho), new_x="LMARGIN", new_y="NEXT")
@@ -221,8 +229,9 @@ class CurriculoHarvard(FPDF):
         self._secao(titulo)
         self.set_font("helvetica", "", 10)
         for item in itens:
-            if item:
-                self.multi_cell(0, 5, sanitize(f"- {item}"), new_x="LMARGIN", new_y="NEXT")
+            val = self._flatten_item(item)
+            if val:
+                self.multi_cell(0, 5, sanitize(f"- {val}"), new_x="LMARGIN", new_y="NEXT")
         self.ln(1)
 
     def bloco_projetos(self, titulo: str, projetos: list):
@@ -231,9 +240,9 @@ class CurriculoHarvard(FPDF):
         for proj in projetos:
             if not isinstance(proj, dict): continue
             self.set_font("helvetica", "B", 10)
-            self.cell(0, 6, sanitize(proj.get("nome", "")), new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 6, sanitize(str(proj.get("nome", ""))), new_x="LMARGIN", new_y="NEXT")
             self.set_font("helvetica", "", 10)
-            self.multi_cell(0, 5, sanitize(proj.get("descricao", "")), new_x="LMARGIN", new_y="NEXT")
+            self.multi_cell(0, 5, sanitize(str(proj.get("descricao", ""))), new_x="LMARGIN", new_y="NEXT")
             self.ln(2)
 
     def bloco_keywords_ocultas(self, keywords: list):
@@ -324,12 +333,13 @@ _SYSTEM_CV = """INSTRUCAO SUPREMA: Voce atua como um Recrutador Tecnico Senior e
 Sua missao e cruzar o HISTORICO do candidato com os dados estruturados da VAGA ALVO e criar um curriculo direcionado.
 
 REGRAS VITAIS E ALGORITMICAS:
-1. MAPEAMENTO DE PALAVRAS-CHAVE: Injete as exatas palavras-chave exigidas pela vaga de forma organica no "resumo", "competencias" e "responsabilidades", SEMPRE que o historico original der suporte.
-2. PREVENCAO DE ALUCINACAO: NUNCA invente experiencias. Se o candidato nao possui um requisito, omita-o do curriculo e liste-o em "analise_gaps".
-3. METODO STAR: Reescreva os bullet points de experiencias focando em impacto quantificavel.
-4. ALAVANCAGEM DE BACKGROUND: Valorize Projetos Pessoais e trabalhos Freelance para compensar lacunas formais.
-5. KEYWORDS OCULTAS: No campo "keywords_ocultas", liste TODOS os termos exigidos pela vaga que o candidato NAO possui experiencia comprovada.
-6. FORMATO: Retorne apenas o JSON puro.
+1. MAPEAMENTO DE PALAVRAS-CHAVE: Injete as exatas palavras-chave exigidas pela vaga de forma organica no "resumo", "competencias" e "responsabilidades".
+2. EQUIVALENCIA TECNOLOGICA (CRITICO): Se a vaga exige uma ferramenta (ex: AWS, Tableau, React) e o candidato possui dominio em uma concorrente direta (ex: GCP, Power BI, Angular), considere como MATCH. No curriculo, escreva no formato "Power BI (Equivalente a Tableau)". NUNCA adicione como gap uma habilidade se o candidato possui o equivalente.
+3. PREVENCAO DE ALUCINACAO: NUNCA invente experiencias. Se o candidato nao possui o requisito nem uma ferramenta equivalente, omita-o do curriculo e liste-o estritamente em "analise_gaps".
+4. METODO STAR: Reescreva os bullet points de experiencias focando em impacto quantificavel.
+5. ALAVANCAGEM DE BACKGROUND: Valorize Projetos Pessoais e trabalhos Freelance para compensar lacunas formais.
+6. KEYWORDS OCULTAS: Liste termos exigidos pela vaga que o candidato NAO possui, para o stealth ATS.
+7. FORMATO: Retorne JSON puro. Para listas de strings (como idiomas e certificacoes), retorne arrays com strings diretas (Ex: ["Ingles - Fluente"]), NUNCA insira objetos JSON dentro das listas simples.
 
 SCHEMA OBRIGATORIO:
 {
@@ -367,7 +377,7 @@ def classificar_intencao(texto: str) -> str:
         prompt=(
             "VAGA = descricao de cargo/emprego\n"
             "HISTORICO = curriculo ou experiencias do usuario\n"
-            "EDICAO = instrucao de atualizacao de dados do perfil\n"
+            "EDICAO = instrucao de atualizacao de dados (Ex: 'adicione que sei power bi', 'remova a empresa X')\n"
             "OUTRO = perguntas gerais, conversas\n\n"
             f"Mensagem:\n{texto[:1500]}"
         ),
@@ -426,7 +436,7 @@ def formatar_perfil_texto(usuario: dict, perfil: dict) -> str:
         hard = [s.get("nome","") for s in skills if "hard" in s.get("categoria","").lower()]
         if hard: linhas.append("\nTECNOLOGIAS: " + ", ".join(hard))
 
-    linhas.append("\nPara editar: descreva a alteracao em texto livre. Ex: Remova a empresa X.")
+    linhas.append("\nPara editar: envie em texto livre. Ex: Adicione conhecimento em Docker e Kubernetes.")
     return "\n".join(linhas)
 
 def perfil_tem_ingles_fluente(perfil: dict) -> bool:
@@ -448,7 +458,7 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) 
     ])
 
     regra_eliminacao = (
-        "- REGRA DE ELIMINACAO (Score 0): Se a vaga exige nivel Senior/Pleno e o candidato e Junior/Estagio (ou vice-versa), o score DEVE ser 0. Nao prossiga com a avaliacao tecnologica.\n"
+        "- REGRA DE ELIMINACAO (Score 0): Se a vaga exige nivel Senior/Pleno e o candidato e Junior/Estagio (ou vice-versa), o score DEVE ser 0.\n"
         if senioridade_alvo else 
         "- Avalie a vaga puramente pelas habilidades tecnicas, pois a senioridade do candidato nao esta definida.\n"
     )
@@ -459,10 +469,11 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) 
             f"Avalie a aderencia de cada vaga ao perfil do candidato. Senioridade alvo: {senioridade_alvo or 'Nao definida'}.\n\n"
             "REGRAS DE PONTUACAO ESTUDADA (0 a 100):\n"
             f"{regra_eliminacao}"
-            "- 80-100: Cargo exato, dominio de mais de 80% do stack tecnologico.\n"
+            "- EQUIVALENCIA TECNOLOGICA: Ferramentas concorrentes (ex: Power BI vs Tableau, AWS vs Azure) possuem a mesma logica base. Considere como MATCH integral. Nao penalize o score se o candidato possui ferramenta equivalente.\n"
+            "- 80-100: Cargo exato, dominio de tecnologias ou equivalentes.\n"
             "- 60-79: Cargo relacionado, dominio de tecnologias core.\n"
-            "- 0-59: Faltam requisitos fundamentais.\n\n"
-            "IMPORTANTE: use numeros INTEIROS de 0 a 100.\n"
+            "- 0-59: Faltam requisitos fundamentais sem compensacao.\n\n"
+            "IMPORTANTE: use numeros INTEIROS de 0 a 100. Nunca retorne numeros decimais.\n"
             'Retorne APENAS este JSON:\n'
             '{"scores": [{"indice": 0, "score": 75, "motivo": "justificativa"}, ...]}\n\n'
             f"PERFIL DO CANDIDATO:\n{json.dumps(perfil, ensure_ascii=False)[:2500]}\n\n"
@@ -476,10 +487,16 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) 
         scores = _parse_json(raw).get("scores", [])
         if not scores: return []
 
-        valores = [s.get("score", 0) for s in scores if isinstance(s, dict)]
-        if valores and max(valores) <= 1.0:
-            for s in scores:
-                if isinstance(s, dict): s["score"] = round(s.get("score", 0) * 100)
+        for s in scores:
+            if isinstance(s, dict):
+                try:
+                    val = float(s.get("score", 0))
+                    if 0 < val <= 1.0:
+                        s["score"] = int(val * 100)
+                    else:
+                        s["score"] = int(val)
+                except Exception:
+                    s["score"] = 0
 
         aprovadas = sorted(
             [s for s in scores if isinstance(s, dict) and s.get("score", 0) >= 60],
@@ -606,7 +623,7 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     usuario = buscar_usuario(user_id)
-    if usuario and usuario.get("email"):
+    if usuario:
         nome = usuario.get("nome_completo", update.effective_user.first_name or "")
         await _enviar_menu(update, context, nome)
         return ConversationHandler.END
@@ -780,8 +797,9 @@ async def processar_e_enviar_vaga(
         if gaps:
             linhas.append("\nGaps identificados:")
             linhas += [f"- {g}" for g in gaps]
+            linhas.append("\nDICA DE GAPS: Se voce possui experiencia com alguma destas ferramentas (ou concorrentes diretas), apenas digite aqui no chat (Ex: 'Adicione que tenho experiencia com Docker no projeto X'). Seu perfil sera atualizado permanentemente.")
+        
         if dica: linhas.append(f"\nDica para entrevista:\n{dica}")
-        linhas.append("\nPara editar o curriculo gerado, use /editar_cv + descricao da alteracao.")
         await bot.send_message(chat_id=telegram_id, text="\n".join(linhas))
 
     if job_hash: registrar_job_enviado(telegram_id, job_hash, titulo, empresa)
@@ -819,7 +837,7 @@ async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
             novas = [v for v in melhores if not job_ja_enviado(telegram_id, gerar_hash_vaga(v))]
             if not novas: continue
 
-            await context.bot.send_message(chat_id=telegram_id, text=f"Bom dia! Suas {len(novas)} sugestao(es) de hoje com curriculo adaptado:")
+            await context.bot.send_message(chat_id=telegram_id, text=f"Bom dia. Suas {len(novas)} sugestao(es) de hoje com curriculo adaptado:")
             for i, vaga in enumerate(novas, 1):
                 try:
                     await processar_e_enviar_vaga(
@@ -964,7 +982,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     usuario = buscar_usuario(user_id)
 
-    if not usuario or not usuario.get("email"):
+    if not usuario:
         await update.message.reply_text("Use /start para configurar seu perfil primeiro.")
         return
 
@@ -1054,7 +1072,7 @@ async def cmd_meu_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query: await update.callback_query.answer()
     user_id = update.effective_user.id if update.message else update.callback_query.from_user.id
     usuario = buscar_usuario(user_id)
-    if not usuario or not usuario.get("email"):
+    if not usuario:
         await context.bot.send_message(chat_id=user_id, text="Use /start para configurar seu perfil primeiro.")
         return
     perfil = usuario.get("perfil_estruturado") or {}
