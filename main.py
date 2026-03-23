@@ -1,9 +1,3 @@
-“””
-ATS Resume Bot - Hub de Carreiras
-
-Arquitetura Serverless, processamento assincrono e pipeline integrado de vagas.
-“””
-
 import os
 import io
 import re
