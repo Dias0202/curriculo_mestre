@@ -11,7 +11,7 @@ from datetime import time as dtime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-from groq import Groq
+from groq import AsyncGroq
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
@@ -50,8 +50,8 @@ if not all([TELEGRAM_TOKEN, GROQ_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
     logger.error("ERRO CRITICO: Variaveis de ambiente ausentes.")
     raise SystemExit(1)
 
-llm_client: Groq   = Groq(api_key=GROQ_API_KEY)
-db_client:  Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+llm_client: AsyncGroq = AsyncGroq(api_key=GROQ_API_KEY)
+db_client:  Client    = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =========================================================
 # KEEP-ALIVE
@@ -73,7 +73,7 @@ def start_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # =========================================================
-# SANITIZACAO DE TEXTO
+# UTILITARIOS E SANITIZACAO
 # =========================================================
 
 _SUBS = {
@@ -91,9 +91,23 @@ def sanitize(text: str) -> str:
         text = text.replace(c, r)
     return text.encode("latin-1", "ignore").decode("latin-1")
 
-# =========================================================
-# EXTRACAO DE TEXTO DE ARQUIVO (PyMuPDF)
-# =========================================================
+def clean_null_value(val) -> str:
+    """Evita corrupcao de string global removendo exclusivamente campos identificados como nulos pelo LLM"""
+    if val is None:
+        return ""
+    v_str = str(val).strip()
+    if v_str.lower() in ("none", "null"):
+        return ""
+    return v_str
+
+def _parse_score(score_raw) -> int:
+    try:
+        val = float(score_raw)
+        if 0 < val <= 1.0:
+            return int(val * 100)
+        return int(val)
+    except (ValueError, TypeError):
+        return 0
 
 def extrair_texto_arquivo(file_bytes: bytearray, filename: str) -> str:
     if filename.lower().endswith(".pdf"):
@@ -140,35 +154,37 @@ class CurriculoHarvard(FPDF):
 
     def _flatten_item(self, item) -> str:
         if isinstance(item, dict):
-            return " - ".join([str(v) for v in item.values() if v])
+            parts = [clean_null_value(v) for v in item.values() if clean_null_value(v)]
+            return " - ".join(parts)
         return str(item)
 
     def bloco_cabecalho(self, ident: dict):
-        nome   = ident.get("nome", "")
-        titulo = ident.get("titulo", "")
+        nome   = clean_null_value(ident.get("nome"))
+        titulo = clean_null_value(ident.get("titulo"))
         self.set_font("helvetica", "B", 18)
         self.multi_cell(0, 10, sanitize(nome), align="C", new_x="LMARGIN", new_y="NEXT")
         if titulo:
             self.set_font("helvetica", "I", 11)
             self.multi_cell(0, 6, sanitize(titulo), align="C", new_x="LMARGIN", new_y="NEXT")
         campos   = ["email", "telefone", "linkedin", "localizacao", "github", "portfolio"]
-        contatos = [str(ident.get(c, "")).strip() for c in campos if ident.get(c, "").strip()]
+        contatos = [clean_null_value(ident.get(c)) for c in campos if clean_null_value(ident.get(c))]
         if contatos:
             self.set_font("helvetica", "", 9)
             self.multi_cell(0, 5, sanitize(" | ".join(contatos)), align="C", new_x="LMARGIN", new_y="NEXT")
         self.ln(4)
 
     def bloco_resumo(self, titulo: str, texto: str):
-        if not texto:
+        txt = clean_null_value(texto)
+        if not txt:
             return
         self._secao(titulo)
-        self._linha(texto)
+        self._linha(txt)
 
     def bloco_competencias(self, titulo: str, lista: list):
         if not lista:
             return
         self._secao(titulo)
-        itens = [sanitize(self._flatten_item(i)) for i in lista if i]
+        itens = [sanitize(self._flatten_item(i)) for i in lista if clean_null_value(self._flatten_item(i))]
         self.set_font("helvetica", "", 10)
         self.multi_cell(0, 5, " | ".join(itens), new_x="LMARGIN", new_y="NEXT")
 
@@ -179,12 +195,12 @@ class CurriculoHarvard(FPDF):
         for exp in exps:
             if not isinstance(exp, dict):
                 continue
-            cargo      = str(exp.get("cargo", "")).strip()
-            empresa    = str(exp.get("empresa", "")).strip()
-            local_exp  = str(exp.get("localizacao", "")).strip()
-            inicio     = str(exp.get("data_inicio", "")).strip()
-            fim        = str(exp.get("data_fim", "")).strip()
-            desc_emp   = str(exp.get("descricao_empresa", "")).strip()
+            cargo      = clean_null_value(exp.get("cargo"))
+            empresa    = clean_null_value(exp.get("empresa"))
+            local_exp  = clean_null_value(exp.get("localizacao"))
+            inicio     = clean_null_value(exp.get("data_inicio"))
+            fim        = clean_null_value(exp.get("data_fim"))
+            desc_emp   = clean_null_value(exp.get("descricao_empresa"))
 
             self.set_font("helvetica", "B", 11)
             linha_cargo = f"{cargo}"
@@ -206,7 +222,7 @@ class CurriculoHarvard(FPDF):
                 self.set_font("helvetica", "I", 9)
                 self.cell(0, 5, sanitize(meta), new_x="LMARGIN", new_y="NEXT")
 
-            if desc_emp and desc_emp.lower() != "none":
+            if desc_emp:
                 self.set_font("helvetica", "I", 9)
                 self.multi_cell(0, 4, sanitize(desc_emp), new_x="LMARGIN", new_y="NEXT")
 
@@ -216,7 +232,7 @@ class CurriculoHarvard(FPDF):
             if isinstance(resps, str):
                 resps = [resps]
             for r in resps:
-                val = self._flatten_item(r)
+                val = clean_null_value(self._flatten_item(r))
                 if val:
                     self._bullet(val, "-")
 
@@ -224,10 +240,10 @@ class CurriculoHarvard(FPDF):
             if isinstance(conquistas, str):
                 conquistas = [conquistas]
             for c in conquistas:
-                val = self._flatten_item(c)
+                val = clean_null_value(self._flatten_item(c))
                 if val:
                     self.set_font("helvetica", "B", 10)
-                    self.multi_cell(0, 5, sanitize(f"- {val}"), new_x="LMARGIN", new_y="NEXT")
+                    self.multi_cell(0, 5, sanitize(f">> {val}"), new_x="LMARGIN", new_y="NEXT")
 
             self.ln(3)
 
@@ -238,11 +254,11 @@ class CurriculoHarvard(FPDF):
         for edu in edus:
             if not isinstance(edu, dict):
                 continue
-            grau  = str(edu.get("grau", "")).strip()
-            curso = str(edu.get("curso", "")).strip()
-            inst  = str(edu.get("instituicao", "")).strip()
-            ini   = str(edu.get("ano_inicio", "")).strip()
-            fim   = str(edu.get("ano_fim", "")).strip()
+            grau  = clean_null_value(edu.get("grau"))
+            curso = clean_null_value(edu.get("curso"))
+            inst  = clean_null_value(edu.get("instituicao"))
+            ini   = clean_null_value(edu.get("ano_inicio"))
+            fim   = clean_null_value(edu.get("ano_fim"))
 
             cabecalho = f"{grau} em {curso}" if grau else curso
             self.set_font("helvetica", "B", 11)
@@ -268,7 +284,7 @@ class CurriculoHarvard(FPDF):
         self._secao(titulo)
         self.set_font("helvetica", "", 10)
         for item in itens:
-            val = self._flatten_item(item)
+            val = clean_null_value(self._flatten_item(item))
             if val:
                 self.multi_cell(0, 5, sanitize(f"- {val}"), new_x="LMARGIN", new_y="NEXT")
         self.ln(1)
@@ -281,15 +297,15 @@ class CurriculoHarvard(FPDF):
             if not isinstance(proj, dict):
                 continue
             self.set_font("helvetica", "B", 10)
-            self.cell(0, 6, sanitize(str(proj.get("nome", ""))), new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 6, sanitize(clean_null_value(proj.get("nome"))), new_x="LMARGIN", new_y="NEXT")
             self.set_font("helvetica", "", 10)
-            self.multi_cell(0, 5, sanitize(str(proj.get("descricao", ""))), new_x="LMARGIN", new_y="NEXT")
+            self.multi_cell(0, 5, sanitize(clean_null_value(proj.get("descricao"))), new_x="LMARGIN", new_y="NEXT")
             self.ln(2)
 
     def bloco_keywords_ocultas(self, keywords: list):
         if not keywords:
             return
-        termos = [sanitize(str(k)) for k in keywords if k]
+        termos = [sanitize(str(k)) for k in keywords if clean_null_value(k)]
         if not termos:
             return
         self.set_text_color(255, 255, 255)
@@ -317,12 +333,12 @@ def gerar_pdf(cv: dict, idioma: str = "Portugues") -> io.BytesIO:
     return buf
 
 # =========================================================
-# GROQ E PROMPTS
+# GROQ E PROMPTS (ASYNC)
 # =========================================================
 
 _MODEL = "llama-3.3-70b-versatile"
 
-def _chat(system: str, prompt: str, json_mode: bool = False, temperature: float = 0.1) -> str:
+async def _chat(system: str, prompt: str, json_mode: bool = False, temperature: float = 0.1) -> str:
     kwargs = dict(
         model=_MODEL,
         messages=[
@@ -334,7 +350,8 @@ def _chat(system: str, prompt: str, json_mode: bool = False, temperature: float 
     )
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
-    resp = llm_client.chat.completions.create(**kwargs)
+    
+    resp = await llm_client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content.strip()
 
 def _parse_json(raw: str) -> dict:
@@ -380,17 +397,27 @@ def _get_cabecalhos(idioma: str) -> dict:
         return _CABECALHOS_ES
     return _CABECALHOS_PT
 
-def _sanitizar_cv(cv: dict, idioma: str = "Portugues") -> dict:
+def _sanitizar_cv(cv: dict, usuario: dict, idioma: str = "Portugues") -> dict:
     if not isinstance(cv, dict):
-        return cv
+        cv = {}
+        
     cv["cabecalhos"] = _get_cabecalhos(idioma)
-    ident = cv.get("identificacao", {})
-    if isinstance(ident, dict):
-        titulo = str(ident.get("titulo", "")).strip()
-        palavras = titulo.split()
-        if len(palavras) > 6:
-            ident["titulo"] = " ".join(palavras[:6])
-        cv["identificacao"] = ident
+    
+    if "identificacao" not in cv or not isinstance(cv["identificacao"], dict):
+        cv["identificacao"] = {}
+        
+    ident = cv["identificacao"]
+    ident["nome"] = usuario.get("nome_completo") or "Candidato"
+    ident["email"] = usuario.get("email") or ""
+    ident["telefone"] = usuario.get("telefone") or ""
+    ident["linkedin"] = usuario.get("linkedin") or ""
+    ident["localizacao"] = usuario.get("cidade") or ""
+    
+    titulo = str(ident.get("titulo", "")).strip()
+    palavras = titulo.split()
+    if len(palavras) > 6:
+        ident["titulo"] = " ".join(palavras[:6])
+        
     return cv
 
 _SYSTEM_CONSOLIDAR = """INSTRUCAO: Voce atua como um Engenheiro de Dados especialista em parsing de documentos de Recursos Humanos.
@@ -399,9 +426,9 @@ Sua funcao e analisar o PERFIL ATUAL do candidato armazenado no banco de dados r
 
 REGRAS DE MERGE E EXTRACAO:
 1. RESOLUCAO DE CONFLITOS: Se a NOVA ENTRADA for um curriculo completo ou historico abrangente, atualize os dados existentes e remova duplicidades logicas. Se for apenas uma atualizacao pontual, insira o novo dado sem apagar o restante.
-2. NORMALIZACAO DE DADOS: Padronize as datas para o formato "Mes/Ano". Categorize as skills como "Hard Skill" ou "Soft Skill".
-3. FIDELIDADE: Nao resuma as descricoes, responsabilidades e conquistas. Mantenha a integridade do texto.
-4. DADOS NAO-TRADICIONAIS: Mapeie freelances para "experiences", projetos para "projects" e intercambios para "education" ou "experiences".
+2. PREENCHIMENTO DE GAPS (CRITICO): Se a instrução do usuario referir-se a uma habilidade equivalente (Ex: "Adicione que domino AWS" ou "Sei Power BI"), INCLUA a ferramenta imediatamente na matriz de skills ou experiências correspondente. Seja inteligente quanto a equivalencias tecnologicas.
+3. NORMALIZACAO DE DADOS: Padronize as datas para o formato "Mes/Ano".
+4. DADOS NAO-TRADICIONAIS: Mapeie freelances para "experiences", projetos para "projects" e intercambios para "education".
 5. FORMATO: Retorne EXCLUSIVAMENTE um objeto JSON valido.
 
 SCHEMA EXIGIDO:
@@ -431,61 +458,48 @@ _SYSTEM_CV = """INSTRUCAO SUPREMA: Voce atua como um Recrutador Tecnico Senior e
 Sua missao e cruzar o HISTORICO do candidato com os dados estruturados da VAGA ALVO e criar um curriculo direcionado.
 
 REGRAS VITAIS E ALGORITMICAS:
-1. MAPEAMENTO DE PALAVRAS-CHAVE: Injete as exatas palavras-chave exigidas pela vaga de forma organica no "resumo", "competencias" e "responsabilidades".
-2. EQUIVALENCIA TECNOLOGICA (CRITICO): Se a vaga exige uma ferramenta (ex: AWS, Tableau) e o candidato possui dominio em uma concorrente direta (ex: GCP, Power BI), considere como MATCH. No curriculo, escreva no formato "Power BI (Equivalente a Tableau)". NUNCA adicione como gap uma habilidade se o candidato possui o equivalente.
-3. PREVENCAO DE ALUCINACAO: NUNCA invente experiencias. Se o candidato nao possui o requisito nem uma ferramenta equivalente, omita-o do curriculo e liste-o estritamente em "analise_gaps".
-4. CABECALHOS PADRONIZADOS (CRITICO): O objeto "cabecalhos" DEVE conter APENAS os titulos padroes de secao de curriculo traduzidos para o idioma alvo. NUNCA insira descricoes, resumos, titulos de cargos ou qualquer outro conteudo neste objeto.
-- EXEMPLOS PROIBIDOS em cabecalhos: "Desenvolvedor Python Senior", "Especialista em IA Generativa", "Projetos de Machine Learning com foco em NLP", "DESENVOLVIMENTO DE SOLUCOES DE IA, ANALISE DE DADOS".
-- EXEMPLOS CORRETOS em cabecalhos: "Experiencia Profissional", "Formacao Academica", "Competencias", "Certificacoes", "Projetos", "Idiomas", "Resumo Profissional".
-5. TITULO PROFISSIONAL: O campo "identificacao.titulo" deve ser CURTO, maximo 6 palavras, representando apenas o cargo-alvo. EXEMPLOS CORRETOS: "Cientista de Dados | IA Generativa", "Engenheiro de Machine Learning". EXEMPLOS PROIBIDOS: "CIENTISTA DE DADOS COM EXPERIENCIA EM MACHINE LEARNING E INTELIGENCIA ARTIFICIAL".
-6. METODO STAR: Reescreva os bullet points de experiencias focando em impacto quantificavel.
-7. ALAVANCAGEM DE BACKGROUND: Valorize Projetos Pessoais e trabalhos Freelance para compensar lacunas formais.
-8. KEYWORDS OCULTAS: Liste termos exigidos pela vaga que o candidato NAO possui, para o stealth ATS.
-9. FORMATO: Retorne JSON puro. Para listas de strings (como idiomas e certificacoes), retorne arrays com strings diretas (Ex: ["Ingles - Fluente"]), NUNCA insira objetos JSON dentro das listas simples.
+1. EQUIVALENCIA TECNOLOGICA (CRITICO): Se a vaga exige uma ferramenta especifica (ex: Tableau, AWS) e o candidato possui dominio comprovado em uma concorrente (ex: Power BI, GCP), a equivalencia e MATCH ABSOLUTO. No curriculo, insira como "Power BI (Equivalente a Tableau)". NUNCA liste a ferramenta originaria da vaga como gap.
+2. PREVENCAO DE ALUCINACAO: NUNCA invente experiencias. Se o candidato nao possui o requisito (nem mesmo equivalente), liste-o estritamente em "analise_gaps".
+3. METODO STAR: Reescreva os bullet points de experiencias focando em impacto quantificavel.
+4. KEYWORDS OCULTAS: Liste os gaps exigidos pela vaga que o candidato NAO possui.
+5. FORMATO DAS LISTAS (CRITICO): Para "idiomas" e "certificacoes", retorne uma lista contendo APENAS strings literais (Ex: ["Ingles - Avancado"]). NUNCA insira dicionarios/JSON nestes campos.
 
 SCHEMA OBRIGATORIO:
 {
-  "cabecalhos": {
-    "resumo": "Resumo Profissional",
-    "competencias": "Competencias",
-    "experiencias": "Experiencia Profissional",
-    "educacao": "Formacao Academica",
-    "certificacoes": "Certificacoes",
-    "projetos": "Projetos",
-    "idiomas": "Idiomas"
-  },
   "identificacao": {
-    "nome": "", "titulo": "", "localizacao": "", "telefone": "", "email": "", "linkedin": "", "github": "", "portfolio": ""
+    "titulo": "Titulo curto do cargo (Maximo 6 palavras)"
   },
-  "resumo": "",
-  "competencias": [],
+  "resumo": "Paragrafo resumo direcionado a vaga",
+  "competencias": ["Competencia 1", "Competencia 2"],
   "experiencias": [
     {
-      "cargo": "", "empresa": "", "localizacao": "", "data_inicio": "", "data_fim": "", "descricao_empresa": "",
-      "responsabilidades": [], "conquistas": []
+      "cargo": "Nome do Cargo", "empresa": "Nome da Empresa", "localizacao": "", "data_inicio": "", "data_fim": "", "descricao_empresa": "",
+      "responsabilidades": ["Tarefa executada"], "conquistas": ["Resultado atingido"]
     }
   ],
   "educacao": [
     {"grau": "", "curso": "", "instituicao": "", "ano_inicio": "", "ano_fim": ""}
   ],
-  "certificacoes": [],
+  "certificacoes": ["Nome da Certificacao - Emissor"],
   "projetos": [{"nome": "", "descricao": ""}],
-  "idiomas": [],
-  "keywords_ocultas": [],
+  "idiomas": ["Idioma - Nivel"],
+  "keywords_ocultas": ["tecnologia ausente no curriculo"],
   "relatorio_analitico": {
-    "match_score": 0, "analise_gaps": [], "dica_entrevista": ""
+    "match_score": "Numero inteiro de 0 a 100", 
+    "analise_gaps": ["Lista de requisitos criticos que o candidato NAO possui (nem equivalentes)"], 
+    "dica_entrevista": "Dica comportamental"
   }
 }"""
 
-def classificar_intencao(texto: str) -> str:
-    if re.search(r"[linkedin.com/jobs](https://linkedin.com/jobs)", texto, re.IGNORECASE):
+async def classificar_intencao(texto: str) -> str:
+    if re.search(r"linkedin.com/jobs", texto, re.IGNORECASE):
         return "URL_LINKEDIN"
-    raw = _chat(
+    raw = await _chat(
         system="Classifique mensagens enviadas a um bot de carreira. Responda APENAS: VAGA, HISTORICO, EDICAO ou OUTRO.",
         prompt=(
             "VAGA = descricao de cargo/emprego\n"
             "HISTORICO = curriculo ou experiencias do usuario\n"
-            "EDICAO = instrucao de atualizacao de dados (Ex: 'adicione que sei power bi', 'remova a empresa X')\n"
+            "EDICAO = instrucao de atualizacao de dados (Ex: 'adicione que sei power bi', 'remova a empresa X', 'tenho aws')\n"
             "OUTRO = perguntas gerais, conversas\n\n"
             f"Mensagem:\n{texto[:1500]}"
         ),
@@ -496,8 +510,8 @@ def classificar_intencao(texto: str) -> str:
             return cat
     return "OUTRO"
 
-def consolidar_perfil(perfil_atual: dict, nova_entrada: str) -> dict:
-    raw = _chat(
+async def consolidar_perfil(perfil_atual: dict, nova_entrada: str) -> dict:
+    raw = await _chat(
         system=_SYSTEM_CONSOLIDAR,
         prompt=(f"PERFIL ATUAL:\n{json.dumps(perfil_atual, ensure_ascii=False)}\n\n"
                 f"NOVA ENTRADA:\n{nova_entrada}"),
@@ -506,9 +520,9 @@ def consolidar_perfil(perfil_atual: dict, nova_entrada: str) -> dict:
     )
     return _parse_json(raw)
 
-def editar_perfil_llm(perfil_atual: dict, instrucao: str) -> dict:
-    raw = _chat(
-        system=(_SYSTEM_CONSOLIDAR + "\n\nMODO EDICAO PONTUAL. Aplique APENAS a mudanca solicitada."),
+async def editar_perfil_llm(perfil_atual: dict, instrucao: str) -> dict:
+    raw = await _chat(
+        system=(_SYSTEM_CONSOLIDAR + "\n\nMODO EDICAO PONTUAL. Aplique as mudancas solicitadas mapeando novas habilidades/ferramentas caso o usuario relate gaps."),
         prompt=(f"PERFIL ATUAL:\n{json.dumps(perfil_atual, ensure_ascii=False)}\n\n"
                 f"INSTRUCAO:\n{instrucao}"),
         json_mode=True,
@@ -518,31 +532,45 @@ def editar_perfil_llm(perfil_atual: dict, instrucao: str) -> dict:
 
 def formatar_perfil_texto(usuario: dict, perfil: dict) -> str:
     linhas = []
-    nome = usuario.get("nome_completo", "Candidato")
+    nome = usuario.get("nome_completo") or "Candidato"
+    cargo = usuario.get("cargo_alvo") or "Nao definido"
+    sen = usuario.get("senioridade") or "Nao definido"
+    
     linhas.append(f"Nome: {nome}")
-    linhas.append(f"Objetivo: {usuario.get('cargo_alvo', 'Nao definido')} ({usuario.get('senioridade', 'Nao definido')})")
+    linhas.append(f"Objetivo: {cargo} ({sen})")
+
     contatos = []
     for k in ["email", "telefone", "linkedin", "cidade"]:
         if usuario.get(k):
             contatos.append(usuario[k])
     if contatos:
         linhas.append("Contato: " + " | ".join(contatos))
+
     exps = perfil.get("experiences", [])
     if exps:
         linhas.append("\nEXPERIENCIAS")
         for e in exps:
-            linhas.append(f"- {e.get('cargo', '')} | {e.get('empresa', '')} ({e.get('data_inicio', '')} a {e.get('data_fim', '')})")
+            inicio = clean_null_value(e.get('data_inicio'))
+            fim = clean_null_value(e.get('data_fim'))
+            periodo = ""
+            if inicio and fim: periodo = f" ({inicio} a {fim})"
+            elif inicio: periodo = f" ({inicio} a Presente)"
+            elif fim: periodo = f" ({fim})"
+            linhas.append(f"- {e.get('cargo', '')} | {e.get('empresa', '')}{periodo}")
+
     edus = perfil.get("education", [])
     if edus:
         linhas.append("\nFORMACAO")
         for ed in edus:
             linhas.append(f"- {ed.get('curso', '')} | {ed.get('instituicao', '')}")
+
     skills = perfil.get("skills", [])
     if skills:
-        hard = [s.get("nome", "") for s in skills if "hard" in s.get("categoria", "").lower()]
+        hard = [str(s.get("nome", "")) for s in skills if "hard" in str(s.get("categoria", "")).lower()]
         if hard:
             linhas.append("\nTECNOLOGIAS: " + ", ".join(hard))
-    linhas.append("\nPara editar: envie em texto livre. Ex: Adicione conhecimento em Docker e Kubernetes.")
+
+    linhas.append("\nPara editar: envie em texto livre. Ex: 'Adicione conhecimento em AWS' ou 'Apague a empresa X'.")
     return "\n".join(linhas)
 
 def perfil_tem_ingles_fluente(perfil: dict) -> bool:
@@ -550,14 +578,14 @@ def perfil_tem_ingles_fluente(perfil: dict) -> bool:
     for lang in perfil.get("languages", []):
         if not isinstance(lang, dict):
             continue
-        idioma = lang.get("idioma", "").lower()
-        nivel  = lang.get("nivel", "").lower()
+        idioma = str(lang.get("idioma", "")).lower()
+        nivel  = str(lang.get("nivel", "")).lower()
         if "ingl" in idioma or "english" in idioma:
             if any(n in nivel for n in niveis_ok):
                 return True
     return False
 
-def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) -> list:
+async def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) -> list:
     lista = "\n".join([
         f"{i}. {v.get('title','')}\n"
         f"   Empresa: {v.get('company','')}\n"
@@ -569,17 +597,17 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) 
         if senioridade_alvo else
         "- Avalie a vaga puramente pelas habilidades tecnicas, pois a senioridade do candidato nao esta definida.\n"
     )
-    raw = _chat(
+    raw = await _chat(
         system="Voce e um recrutador tecnico senior. Retorne SOMENTE JSON valido.",
         prompt=(
             f"Avalie a aderencia de cada vaga ao perfil do candidato. Senioridade alvo: {senioridade_alvo or 'Nao definida'}.\n\n"
             "REGRAS DE PONTUACAO ESTUDADA (0 a 100):\n"
             f"{regra_eliminacao}"
-            "- EQUIVALENCIA TECNOLOGICA: Ferramentas concorrentes (ex: Power BI vs Tableau, AWS vs Azure) possuem a mesma logica base. Considere como MATCH integral. Nao penalize o score se o candidato possui ferramenta equivalente.\n"
+            "- EQUIVALENCIA TECNOLOGICA: Ferramentas concorrentes possuem a mesma logica base. Considere como MATCH integral.\n"
             "- 80-100: Cargo exato, dominio de tecnologias ou equivalentes.\n"
             "- 60-79: Cargo relacionado, dominio de tecnologias core.\n"
             "- 0-59: Faltam requisitos fundamentais sem compensacao.\n\n"
-            "IMPORTANTE: use numeros INTEIROS de 0 a 100. Nunca retorne numeros decimais.\n"
+            "IMPORTANTE: use numeros INTEIROS de 0 a 100.\n"
             'Retorne APENAS este JSON:\n'
             '{"scores": [{"indice": 0, "score": 75, "motivo": "justificativa"}, ...]}\n\n'
             f"PERFIL DO CANDIDATO:\n{json.dumps(perfil, ensure_ascii=False)[:2500]}\n\n"
@@ -592,16 +620,11 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) 
         scores = _parse_json(raw).get("scores", [])
         if not scores:
             return []
+        
         for s in scores:
             if isinstance(s, dict):
-                try:
-                    val = float(s.get("score", 0))
-                    if 0 < val <= 1.0:
-                        s["score"] = int(val * 100)
-                    else:
-                        s["score"] = int(val)
-                except Exception:
-                    s["score"] = 0
+                s["score"] = _parse_score(s.get("score", 0))
+
         aprovadas = sorted(
             [s for s in scores if isinstance(s, dict) and s.get("score", 0) >= 60],
             key=lambda s: s.get("score", 0),
@@ -617,10 +640,10 @@ def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo: str) 
         logger.error(f"[Score] Erro pontuacao: {e}", exc_info=True)
         return []
 
-def gerar_cv_json(perfil: dict, usuario: dict, titulo_vaga: str, empresa_vaga: str, local_vaga: str, descricao_vaga: str, com_resumo: bool = True) -> dict:
+async def gerar_cv_json(perfil: dict, usuario: dict, titulo_vaga: str, empresa_vaga: str, local_vaga: str, descricao_vaga: str, com_resumo: bool = True) -> dict:
     idioma           = usuario.get("idioma", "Portugues")
     instrucao_resumo = "" if com_resumo else "\nIMPORTANTE: Deixe o campo 'resumo' vazio."
-    raw = _chat(
+    raw = await _chat(
         system=_SYSTEM_CV,
         prompt=(
             f"HISTORICO DO CANDIDATO:\n{json.dumps(perfil, ensure_ascii=False)}\n\n"
@@ -631,11 +654,11 @@ def gerar_cv_json(perfil: dict, usuario: dict, titulo_vaga: str, empresa_vaga: s
         json_mode=True,
         temperature=0.15,
     )
-    cv = _parse_json(raw)
-    return _sanitizar_cv(cv, idioma)
+    cv_bruto = _parse_json(raw)
+    return _sanitizar_cv(cv_bruto, usuario, idioma)
 
-def editar_cv_json(cv_atual: dict, instrucao: str) -> dict:
-    raw = _chat(
+async def editar_cv_json(cv_atual: dict, instrucao: str) -> dict:
+    raw = await _chat(
         system="Aplique APENAS a alteracao solicitada no JSON do curriculo. Mantenha os outros campos.",
         prompt=(f"CURRICULO ATUAL:\n{json.dumps(cv_atual, ensure_ascii=False)}\n\n"
                 f"INSTRUCAO:\n{instrucao}"),
@@ -728,9 +751,10 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    usuario = buscar_usuario(user_id)
+    # Call Supabase async via to_thread to prevent blocking event loop
+    usuario = await asyncio.to_thread(buscar_usuario, user_id)
     if usuario:
-        nome = usuario.get("nome_completo", update.effective_user.first_name or "")
+        nome = usuario.get("nome_completo") or update.effective_user.first_name or ""
         await _enviar_menu(update, context, nome)
         return ConversationHandler.END
     await update.message.reply_text(
@@ -804,7 +828,8 @@ async def callback_seniority(update: Update, context: ContextTypes.DEFAULT_TYPE)
     senioridade = query.data.split("_")[1]
     user_id     = update.effective_user.id
     cargo_alvo  = context.user_data.get("cargo_alvo", "")
-    salvar_perfil(user_id, {
+    
+    dados = {
         "nome_completo": context.user_data.get("nome_completo", ""),
         "email":         context.user_data.get("email", ""),
         "telefone":      context.user_data.get("telefone", ""),
@@ -813,8 +838,10 @@ async def callback_seniority(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "idioma":        context.user_data.get("idioma", ""),
         "cargo_alvo":    cargo_alvo,
         "senioridade":   senioridade,
-    })
+    }
+    await asyncio.to_thread(salvar_perfil, user_id, dados)
     context.user_data.clear()
+    
     await query.edit_message_text(
         f"Perfil salvo.\n"
         f"Objetivo: {cargo_alvo} ({senioridade})\n\n"
@@ -847,7 +874,7 @@ async def callback_tipo_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Sessao expirada. Envie a vaga novamente.")
         return
     user_id = str(update.effective_user.id)
-    usuario = buscar_usuario(user_id)
+    usuario = await asyncio.to_thread(buscar_usuario, user_id)
     perfil  = (usuario or {}).get("perfil_estruturado") or {}
     tipo_txt = "com resumo" if com_resumo else "sem resumo"
     await query.edit_message_text(f"Gerando curriculo ATS {tipo_txt}... Aguarde.")
@@ -873,14 +900,14 @@ async def processar_e_enviar_vaga(
     com_resumo: bool = True, context: ContextTypes.DEFAULT_TYPE = None,
 ):
     idioma  = usuario.get("idioma", "Portugues")
-    cv      = gerar_cv_json(perfil, usuario, titulo, empresa, local, descricao, com_resumo)
-    pdf_buf = gerar_pdf(cv, idioma)
+    cv      = await gerar_cv_json(perfil, usuario, titulo, empresa, local, descricao, com_resumo)
+    pdf_buf = await asyncio.to_thread(gerar_pdf, cv, idioma)
 
     if context is not None:
         context.user_data["ultimo_cv"]      = cv
         context.user_data["ultimo_usuario"] = usuario
 
-    nome_usuario = usuario.get("nome_completo", "Candidato")
+    nome_usuario = usuario.get("nome_completo") or "Candidato"
     nome_vaga    = titulo or empresa or "Vaga"
 
     def _slug(s: str) -> str:
@@ -895,7 +922,7 @@ async def processar_e_enviar_vaga(
 
     rel = cv.get("relatorio_analitico", {})
     if rel:
-        score = rel.get("match_score", "?")
+        score = _parse_score(rel.get("match_score", 0))
         gaps  = rel.get("analise_gaps", [])
         dica  = rel.get("dica_entrevista", "")
         linhas = [f"Relatorio ATS - Vaga {indice}", f"Match Score: {score}/100"]
@@ -911,7 +938,7 @@ async def processar_e_enviar_vaga(
         await bot.send_message(chat_id=telegram_id, text="\n".join(linhas))
 
     if job_hash:
-        registrar_job_enviado(telegram_id, job_hash, titulo, empresa)
+        await asyncio.to_thread(registrar_job_enviado, telegram_id, job_hash, titulo, empresa)
 
 # =========================================================
 # JOB DIARIO E ROTINAS DE SCRAPING
@@ -919,29 +946,37 @@ async def processar_e_enviar_vaga(
 
 async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
     logger.info("[Scheduler] Iniciando sugestoes diarias...")
-    usuarios = buscar_todos_usuarios()
+    usuarios = await asyncio.to_thread(buscar_todos_usuarios)
     for usuario in usuarios:
         telegram_id = usuario.get("telegram_id")
         perfil      = usuario.get("perfil_estruturado") or {}
         cidade      = usuario.get("cidade", "Brazil")
         if not telegram_id or not perfil:
             continue
+            
         cargo_alvo  = usuario.get("cargo_alvo", "")
         senioridade = usuario.get("senioridade", "")
-        termo_busca = f"{cargo_alvo} {senioridade}".strip()
+        
+        termo_busca = cargo_alvo.strip()
         if not termo_busca:
-            logger.info(f"[Scheduler] Usuario {telegram_id} sem cargo/senioridade. Pulando.")
+            logger.info(f"[Scheduler] Usuario {telegram_id} sem cargo alvo. Pulando.")
             continue
+            
         ingles_fluente = perfil_tem_ingles_fluente(perfil)
         try:
-            vagas = buscar_vagas_jobspy(
-                cargo=termo_busca, keywords="", cidade=cidade, quantidade=10,
-                buscar_remoto=True, ingles_fluente=ingles_fluente,
+            vagas = await asyncio.to_thread(buscar_vagas_jobspy,
+                termo_busca, "", cidade, 10, True, ingles_fluente
             )
             if not vagas:
                 continue
-            melhores = selecionar_melhores_vagas(perfil, vagas, senioridade)
-            novas    = [v for v in melhores if not job_ja_enviado(telegram_id, gerar_hash_vaga(v))]
+            melhores = await selecionar_melhores_vagas(perfil, vagas, senioridade)
+            
+            novas = []
+            for v in melhores:
+                ja_enviado = await asyncio.to_thread(job_ja_enviado, telegram_id, gerar_hash_vaga(v))
+                if not ja_enviado:
+                    novas.append(v)
+            
             if not novas:
                 continue
             await context.bot.send_message(
@@ -970,7 +1005,7 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id    = str(update.effective_user.id)
         status_msg = await update.message.reply_text("Iniciando varredura no LinkedIn e Indeed...")
 
-    usuario = buscar_usuario(user_id)
+    usuario = await asyncio.to_thread(buscar_usuario, user_id)
     perfil  = usuario.get("perfil_estruturado") if usuario else None
     if not perfil:
         await status_msg.edit_text("Voce ainda nao tem perfil estruturado. Envie um historico profissional base primeiro.")
@@ -979,20 +1014,26 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cidade      = usuario.get("cidade", "Brazil")
     cargo_alvo  = usuario.get("cargo_alvo", "")
     senioridade = usuario.get("senioridade", "")
-    termo_busca = f"{cargo_alvo} {senioridade}".strip()
+    
+    termo_busca = cargo_alvo.strip()
     ingles_fluente = perfil_tem_ingles_fluente(perfil)
 
-    vagas = buscar_vagas_jobspy(
-        cargo=termo_busca, keywords="", cidade=cidade, quantidade=10,
-        buscar_remoto=True, ingles_fluente=ingles_fluente,
+    vagas = await asyncio.to_thread(buscar_vagas_jobspy,
+        termo_busca, "", cidade, 10, True, ingles_fluente
     )
     if not vagas:
         await status_msg.edit_text("Nenhuma vaga encontrada agora. Tente novamente mais tarde.")
         return
 
     await status_msg.edit_text("Vagas encontradas. Avaliando aderencia tecnica com IA...")
-    melhores = selecionar_melhores_vagas(perfil, vagas, senioridade)
-    novas    = [v for v in melhores if not job_ja_enviado(user_id, gerar_hash_vaga(v))]
+    melhores = await selecionar_melhores_vagas(perfil, vagas, senioridade)
+    
+    novas = []
+    for v in melhores:
+        ja_enviado = await asyncio.to_thread(job_ja_enviado, user_id, gerar_hash_vaga(v))
+        if not ja_enviado:
+            novas.append(v)
+            
     if not novas:
         await status_msg.edit_text("As vagas encontradas possuem baixa aderencia ao seu historico ou ja foram enviadas.")
         return
@@ -1018,7 +1059,7 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_notificar_pendentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Iniciando varredura de perfis incompletos...")
-    usuarios   = buscar_todos_usuarios()
+    usuarios   = await asyncio.to_thread(buscar_todos_usuarios)
     notificados = 0
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Atualizar Objetivo Agora", callback_data="menu_atualizar_objetivo")]
@@ -1055,7 +1096,7 @@ async def cmd_notificar_pendentes(update: Update, context: ContextTypes.DEFAULT_
 async def cmd_editar_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id  = str(update.effective_user.id)
     cv_atual = context.user_data.get("ultimo_cv")
-    usuario  = context.user_data.get("ultimo_usuario") or buscar_usuario(user_id)
+    usuario  = context.user_data.get("ultimo_usuario") or await asyncio.to_thread(buscar_usuario, user_id)
     if not cv_atual:
         await update.message.reply_text("Nenhum curriculo gerado nesta sessao.")
         return
@@ -1066,11 +1107,11 @@ async def cmd_editar_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     status = await update.message.reply_text("Aplicando edicao no curriculo... Aguarde.")
     try:
-        cv_novo = editar_cv_json(cv_atual, instrucao)
+        cv_novo = await editar_cv_json(cv_atual, instrucao)
         idioma_edit = (usuario or {}).get("idioma", "Portugues")
-        pdf_buf = gerar_pdf(cv_novo, idioma_edit)
+        pdf_buf = await asyncio.to_thread(gerar_pdf, cv_novo, idioma_edit)
         context.user_data["ultimo_cv"] = cv_novo
-        nome_usuario = (usuario or {}).get("nome_completo", "Candidato")
+        nome_usuario = (usuario or {}).get("nome_completo") or "Candidato"
         def _slug(s: str) -> str:
             return re.sub(r"[^\w\-]", "_", s.strip())[:40]
         nome_arquivo = f"{_slug(nome_usuario)}_editado.pdf"
@@ -1086,7 +1127,7 @@ async def cmd_meu_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.callback_query.from_user.id)
     else:
         user_id = str(update.effective_user.id)
-    usuario = buscar_usuario(user_id)
+    usuario = await asyncio.to_thread(buscar_usuario, user_id)
     if not usuario:
         texto = "Voce ainda nao possui perfil cadastrado. Use /start para comecar."
     else:
@@ -1104,8 +1145,8 @@ async def cmd_deletar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         user_id = str(update.effective_user.id)
     try:
-        db_client.table("user_profiles").delete().eq("telegram_id", user_id).execute()
-        db_client.table("sent_jobs").delete().eq("telegram_id", user_id).execute()
+        await asyncio.to_thread(db_client.table("user_profiles").delete().eq("telegram_id", user_id).execute)
+        await asyncio.to_thread(db_client.table("sent_jobs").delete().eq("telegram_id", user_id).execute)
         msg = "Seus dados foram removidos com sucesso. Use /start para comecar do zero."
     except Exception as e:
         logger.error(f"[Deletar] {e}", exc_info=True)
@@ -1117,9 +1158,8 @@ async def cmd_deletar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    usuario = buscar_usuario(user_id)
+    usuario = await asyncio.to_thread(buscar_usuario, user_id)
 
-    # --- Arquivo (PDF ou TXT) ---
     if update.message.document:
         doc      = update.message.document
         filename = doc.file_name or "arquivo.pdf"
@@ -1127,13 +1167,13 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         try:
             file_obj   = await doc.get_file()
             file_bytes = bytearray(await file_obj.download_as_bytearray())
-            texto      = extrair_texto_arquivo(file_bytes, filename)
+            texto      = await asyncio.to_thread(extrair_texto_arquivo, file_bytes, filename)
             if not texto.strip():
                 await status.edit_text("Nao consegui extrair texto do arquivo. Tente enviar em .txt ou cole o texto diretamente.")
                 return
             perfil_atual = (usuario or {}).get("perfil_estruturado") or {}
-            novo_perfil  = consolidar_perfil(perfil_atual, texto)
-            atualizar_perfil_estruturado(user_id, novo_perfil)
+            novo_perfil  = await consolidar_perfil(perfil_atual, texto)
+            await asyncio.to_thread(atualizar_perfil_estruturado, user_id, novo_perfil)
             await status.edit_text(
                 "Historico processado e salvo com sucesso!\n\n"
                 "Agora envie uma descricao de vaga ou link do LinkedIn para gerar seu curriculo adaptado."
@@ -1147,16 +1187,15 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
     if not texto_msg:
         return
 
-    intencao = classificar_intencao(texto_msg)
+    intencao = await classificar_intencao(texto_msg)
 
-    # --- URL LinkedIn ---
     if intencao == "URL_LINKEDIN":
         if not usuario or not usuario.get("perfil_estruturado"):
             await update.message.reply_text("Envie seu historico profissional primeiro antes de solicitar uma vaga.")
             return
         status = await update.message.reply_text("Extraindo vaga do LinkedIn... Aguarde.")
         try:
-            vaga = extrair_vaga_linkedin(texto_msg)
+            vaga = await asyncio.to_thread(extrair_vaga_linkedin, texto_msg)
             if not vaga:
                 await status.edit_text("Nao consegui extrair a vaga. Verifique o link ou cole a descricao manualmente.")
                 return
@@ -1167,7 +1206,6 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
             await status.edit_text(f"Erro ao extrair vaga: {e}")
         return
 
-    # --- Descricao de vaga em texto ---
     if intencao == "VAGA":
         if not usuario or not usuario.get("perfil_estruturado"):
             await update.message.reply_text("Envie seu historico profissional primeiro antes de solicitar uma vaga.")
@@ -1176,13 +1214,12 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         await _perguntar_tipo_cv(update, context, vaga_dados)
         return
 
-    # --- Historico profissional em texto ---
     if intencao == "HISTORICO":
         status = await update.message.reply_text("Processando seu historico... Aguarde.")
         try:
             perfil_atual = (usuario or {}).get("perfil_estruturado") or {}
-            novo_perfil  = consolidar_perfil(perfil_atual, texto_msg)
-            atualizar_perfil_estruturado(user_id, novo_perfil)
+            novo_perfil  = await consolidar_perfil(perfil_atual, texto_msg)
+            await asyncio.to_thread(atualizar_perfil_estruturado, user_id, novo_perfil)
             await status.edit_text(
                 "Historico atualizado com sucesso!\n\n"
                 "Agora envie uma descricao de vaga ou link do LinkedIn para gerar seu curriculo adaptado."
@@ -1192,7 +1229,6 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
             await status.edit_text(f"Erro ao processar historico: {e}")
         return
 
-    # --- Edicao de perfil ---
     if intencao == "EDICAO":
         if not usuario or not usuario.get("perfil_estruturado"):
             await update.message.reply_text("Voce ainda nao tem perfil salvo para editar.")
@@ -1200,15 +1236,14 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         status = await update.message.reply_text("Aplicando atualizacao no seu perfil... Aguarde.")
         try:
             perfil_atual = usuario.get("perfil_estruturado") or {}
-            novo_perfil  = editar_perfil_llm(perfil_atual, texto_msg)
-            atualizar_perfil_estruturado(user_id, novo_perfil)
+            novo_perfil  = await editar_perfil_llm(perfil_atual, texto_msg)
+            await asyncio.to_thread(atualizar_perfil_estruturado, user_id, novo_perfil)
             await status.edit_text("Perfil atualizado com sucesso!")
         except Exception as e:
             logger.error(f"[Edicao] {e}", exc_info=True)
             await status.edit_text(f"Erro ao atualizar perfil: {e}")
         return
 
-    # --- Fallback ---
     await update.message.reply_text(
         "Nao entendi sua mensagem. Voce pode:\n"
         "- Enviar a descricao de uma vaga\n"
