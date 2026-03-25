@@ -1,5 +1,5 @@
 """
-scraper.py — Extrator de vagas focado em senioridade explicita e estabilidade.
+scraper.py — Extrator de vagas com fallback e bypass basico de bloqueio.
 """
 
 import re
@@ -79,15 +79,22 @@ def extrair_vaga_linkedin(url: str, db_client=None) -> dict:
         return {"sucesso": False, "erro": "Resposta invalida do LinkedIn."}
 
     soup = BeautifulSoup(resposta.text, "html.parser")
-    def _get(tag, cls):
-        el = soup.find(tag, class_=cls)
-        return el.text.strip() if el else ""
+    
+    # Seletores mais robustos para contornar mudancas na DOM
+    titulo_el = soup.find("h2", class_=lambda x: x and "title" in x.lower()) or soup.find("h1")
+    titulo = titulo_el.text.strip() if titulo_el else ""
 
-    titulo      = _get("h2", "top-card-layout__title")
-    empresa     = _get("a",  "topcard__org-name-link")
-    localizacao = _get("span", "topcard__flavor topcard__flavor--bullet")
-    desc_el     = soup.find("div", class_="show-more-less-html__markup")
-    descricao   = desc_el.get_text(separator="\n", strip=True) if desc_el else ""
+    if not titulo:
+        return {"sucesso": False, "erro": "Bloqueio por Captcha ativado."}
+
+    empresa_el = soup.find("a", class_=lambda x: x and "org-name" in x.lower()) or soup.find("a", class_="topcard__flavor--black-link")
+    empresa = empresa_el.text.strip() if empresa_el else "Empresa Confidencial"
+
+    localizacao_el = soup.find("span", class_="topcard__flavor--bullet") or soup.find("span", class_="topcard__flavor")
+    localizacao = localizacao_el.text.strip() if localizacao_el else ""
+
+    desc_el = soup.find("div", class_="show-more-less-html__markup")
+    descricao = desc_el.get_text(separator="\n", strip=True) if desc_el else ""
 
     dados = {
         "id": job_id, "titulo": titulo, "empresa": empresa,
