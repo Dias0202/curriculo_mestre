@@ -92,7 +92,6 @@ def sanitize(text: str) -> str:
     return text.encode("latin-1", "ignore").decode("latin-1")
 
 def clean_null_value(val) -> str:
-    """Evita corrupcao de string global removendo exclusivamente campos identificados como nulos pelo LLM"""
     if val is None:
         return ""
     v_str = str(val).strip()
@@ -102,11 +101,16 @@ def clean_null_value(val) -> str:
 
 def _parse_score(score_raw) -> int:
     try:
-        val = float(score_raw)
-        if 0 < val <= 1.0:
-            return int(val * 100)
-        return int(val)
-    except (ValueError, TypeError):
+        match = re.search(r"([0-9]+[.,]?[0-9]*)", str(score_raw))
+        if match:
+            val = float(match.group(1).replace(',', '.'))
+            if 0 < val <= 1.0:
+                return int(val * 100)
+            if val > 100:
+                return 100
+            return int(val)
+        return 0
+    except Exception:
         return 0
 
 def extrair_texto_arquivo(file_bytes: bytearray, filename: str) -> str:
@@ -212,7 +216,7 @@ class CurriculoHarvard(FPDF):
             if inicio and fim:
                 meta = f"{inicio} - {fim}"
             elif inicio:
-                meta = f"{inicio} - Presente"
+                meta = f"{inicio} - Atual"
             elif fim:
                 meta = fim
 
@@ -358,7 +362,7 @@ def _parse_json(raw: str) -> dict:
     return json.loads(re.sub(r"```json|```", "", raw).strip())
 
 # =========================================================
-# CABECALHOS HARDCODED
+# CABECALHOS HARDCODED E SYNC DB
 # =========================================================
 
 _CABECALHOS_PT = {
@@ -420,19 +424,22 @@ def _sanitizar_cv(cv: dict, usuario: dict, idioma: str = "Portugues") -> dict:
         
     return cv
 
-_SYSTEM_CONSOLIDAR = """INSTRUCAO: Voce atua como um Engenheiro de Dados especialista em parsing de documentos de Recursos Humanos.
+_SYSTEM_CONSOLIDAR = """INSTRUCAO: Voce atua como um Engenheiro de Dados especialista em parsing de perfis e curriculos.
 
-Sua funcao e analisar o PERFIL ATUAL do candidato armazenado no banco de dados relacional e a NOVA ENTRADA de dados fornecida pelo usuario. Seu objetivo e retornar um JSON consolidado, normalizado e atualizado.
+Sua funcao e analisar o PERFIL ATUAL do candidato armazenado no banco de dados e a NOVA ENTRADA de dados.
+Seu objetivo e retornar um JSON consolidado, normalizado e atualizado.
 
-REGRAS DE MERGE E EXTRACAO:
-1. RESOLUCAO DE CONFLITOS: Se a NOVA ENTRADA for um curriculo completo ou historico abrangente, atualize os dados existentes e remova duplicidades logicas. Se for apenas uma atualizacao pontual, insira o novo dado sem apagar o restante.
-2. PREENCHIMENTO DE GAPS (CRITICO): Se a instrução do usuario referir-se a uma habilidade equivalente (Ex: "Adicione que domino AWS" ou "Sei Power BI"), INCLUA a ferramenta imediatamente na matriz de skills ou experiências correspondente. Seja inteligente quanto a equivalencias tecnologicas.
-3. NORMALIZACAO DE DADOS: Padronize as datas para o formato "Mes/Ano".
-4. DADOS NAO-TRADICIONAIS: Mapeie freelances para "experiences", projetos para "projects" e intercambios para "education".
-5. FORMATO: Retorne EXCLUSIVAMENTE um objeto JSON valido.
+REGRAS VITAIS:
+1. DADOS PESSOAIS: Se o usuario informar seu nome, telefone, cidade ou linkedin, atualize o bloco "dados_pessoais". NUNCA apague contatos previamente existentes a menos que explicitamente solicitado.
+2. PREENCHIMENTO DE GAPS (CRITICO): Se a instrução do usuario for sobre adicionar ou editar alguma ferramenta/experiencia, adicione IMEDIATAMENTE as habilidades no bloco "skills" ou "experiences". Seja proativo na equivalencia.
+3. DADOS NAO-TRADICIONAIS: Mapeie freelances para "experiences", projetos para "projects".
+4. FORMATO STRICT: Retorne EXCLUSIVAMENTE um objeto JSON valido.
 
 SCHEMA EXIGIDO:
 {
+  "dados_pessoais": {
+    "nome": "", "email": "", "telefone": "", "linkedin": "", "cidade": ""
+  },
   "experiences": [
     {"cargo":"","empresa":"","localizacao":"","data_inicio":"","data_fim":"","descricao_empresa":"","responsabilidades":[],"conquistas":[]}
   ],
@@ -455,14 +462,14 @@ SCHEMA EXIGIDO:
 
 _SYSTEM_CV = """INSTRUCAO SUPREMA: Voce atua como um Recrutador Tecnico Senior e Especialista em Sistemas ATS.
 
-Sua missao e cruzar o HISTORICO do candidato com os dados estruturados da VAGA ALVO e criar um curriculo direcionado.
+Sua missao e cruzar o HISTORICO do candidato com os dados da VAGA ALVO e criar um curriculo otimizado em JSON.
 
 REGRAS VITAIS E ALGORITMICAS:
-1. EQUIVALENCIA TECNOLOGICA (CRITICO): Se a vaga exige uma ferramenta especifica (ex: Tableau, AWS) e o candidato possui dominio comprovado em uma concorrente (ex: Power BI, GCP), a equivalencia e MATCH ABSOLUTO. No curriculo, insira como "Power BI (Equivalente a Tableau)". NUNCA liste a ferramenta originaria da vaga como gap.
-2. PREVENCAO DE ALUCINACAO: NUNCA invente experiencias. Se o candidato nao possui o requisito (nem mesmo equivalente), liste-o estritamente em "analise_gaps".
+1. EQUIVALENCIA TECNOLOGICA (CRITICO): Se a vaga exige uma ferramenta (ex: Tableau, AWS) e o candidato possui dominio em concorrente (ex: Power BI, GCP), isto e MATCH ABSOLUTO. Escreva "Power BI (Equivalente a Tableau)" e NUNCA liste a ferramenta original como gap.
+2. PREVENCAO DE ALUCINACAO: NUNCA invente experiencias. Se o candidato nao possui o requisito (nem equivalente), liste em "analise_gaps".
 3. METODO STAR: Reescreva os bullet points de experiencias focando em impacto quantificavel.
-4. KEYWORDS OCULTAS: Liste os gaps exigidos pela vaga que o candidato NAO possui.
-5. FORMATO DAS LISTAS (CRITICO): Para "idiomas" e "certificacoes", retorne uma lista contendo APENAS strings literais (Ex: ["Ingles - Avancado"]). NUNCA insira dicionarios/JSON nestes campos.
+4. KEYWORDS OCULTAS: Liste os gaps exigidos pela vaga que o candidato NAO possui, para o stealth ATS.
+5. FORMATO DAS LISTAS (CRITICO): Para "idiomas" e "certificacoes", retorne um ARRAY CONTENDO APENAS STRINGS (Ex: ["Ingles - Avancado"]). E ESTRITAMENTE PROIBIDO INSERIR OBJETOS JSON, DICIONARIOS OU CHAVES NESTES ARRAYS.
 
 SCHEMA OBRIGATORIO:
 {
@@ -486,7 +493,7 @@ SCHEMA OBRIGATORIO:
   "keywords_ocultas": ["tecnologia ausente no curriculo"],
   "relatorio_analitico": {
     "match_score": "Numero inteiro de 0 a 100", 
-    "analise_gaps": ["Lista de requisitos criticos que o candidato NAO possui (nem equivalentes)"], 
+    "analise_gaps": ["Requisitos criticos que o candidato NAO possui (nem equivalentes)"], 
     "dica_entrevista": "Dica comportamental"
   }
 }"""
@@ -499,7 +506,7 @@ async def classificar_intencao(texto: str) -> str:
         prompt=(
             "VAGA = descricao de cargo/emprego\n"
             "HISTORICO = curriculo ou experiencias do usuario\n"
-            "EDICAO = instrucao de atualizacao de dados (Ex: 'adicione que sei power bi', 'remova a empresa X', 'tenho aws')\n"
+            "EDICAO = instrucao de atualizacao de dados (Ex: 'meu nome e X', 'sei power bi', 'remova a empresa X')\n"
             "OUTRO = perguntas gerais, conversas\n\n"
             f"Mensagem:\n{texto[:1500]}"
         ),
@@ -522,7 +529,7 @@ async def consolidar_perfil(perfil_atual: dict, nova_entrada: str) -> dict:
 
 async def editar_perfil_llm(perfil_atual: dict, instrucao: str) -> dict:
     raw = await _chat(
-        system=(_SYSTEM_CONSOLIDAR + "\n\nMODO EDICAO PONTUAL. Aplique as mudancas solicitadas mapeando novas habilidades/ferramentas caso o usuario relate gaps."),
+        system=(_SYSTEM_CONSOLIDAR + "\n\nMODO EDICAO PONTUAL. Aplique as mudancas solicitadas. Atualize 'dados_pessoais' caso o usuario mencione seu nome/contato."),
         prompt=(f"PERFIL ATUAL:\n{json.dumps(perfil_atual, ensure_ascii=False)}\n\n"
                 f"INSTRUCAO:\n{instrucao}"),
         json_mode=True,
@@ -554,7 +561,7 @@ def formatar_perfil_texto(usuario: dict, perfil: dict) -> str:
             fim = clean_null_value(e.get('data_fim'))
             periodo = ""
             if inicio and fim: periodo = f" ({inicio} a {fim})"
-            elif inicio: periodo = f" ({inicio} a Presente)"
+            elif inicio: periodo = f" ({inicio} a Atual)"
             elif fim: periodo = f" ({fim})"
             linhas.append(f"- {e.get('cargo', '')} | {e.get('empresa', '')}{periodo}")
 
@@ -570,7 +577,7 @@ def formatar_perfil_texto(usuario: dict, perfil: dict) -> str:
         if hard:
             linhas.append("\nTECNOLOGIAS: " + ", ".join(hard))
 
-    linhas.append("\nPara editar: envie em texto livre. Ex: 'Adicione conhecimento em AWS' ou 'Apague a empresa X'.")
+    linhas.append("\nPara editar: envie em texto livre. Ex: 'Meu nome eh X' ou 'Adicione conhecimento em AWS'.")
     return "\n".join(linhas)
 
 def perfil_tem_ingles_fluente(perfil: dict) -> bool:
@@ -595,7 +602,7 @@ async def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo:
     regra_eliminacao = (
         "- REGRA DE ELIMINACAO (Score 0): Se a vaga exige nivel Senior/Pleno e o candidato e Junior/Estagio (ou vice-versa), o score DEVE ser 0.\n"
         if senioridade_alvo else
-        "- Avalie a vaga puramente pelas habilidades tecnicas, pois a senioridade do candidato nao esta definida.\n"
+        "- Avalie a vaga puramente pelas habilidades tecnicas.\n"
     )
     raw = await _chat(
         system="Voce e um recrutador tecnico senior. Retorne SOMENTE JSON valido.",
@@ -603,11 +610,11 @@ async def selecionar_melhores_vagas(perfil: dict, vagas: list, senioridade_alvo:
             f"Avalie a aderencia de cada vaga ao perfil do candidato. Senioridade alvo: {senioridade_alvo or 'Nao definida'}.\n\n"
             "REGRAS DE PONTUACAO ESTUDADA (0 a 100):\n"
             f"{regra_eliminacao}"
-            "- EQUIVALENCIA TECNOLOGICA: Ferramentas concorrentes possuem a mesma logica base. Considere como MATCH integral.\n"
+            "- EQUIVALENCIA TECNOLOGICA: Ferramentas concorrentes (Ex: AWS/Azure, Power BI/Tableau) possuem a mesma logica base. Considere como MATCH integral.\n"
             "- 80-100: Cargo exato, dominio de tecnologias ou equivalentes.\n"
             "- 60-79: Cargo relacionado, dominio de tecnologias core.\n"
             "- 0-59: Faltam requisitos fundamentais sem compensacao.\n\n"
-            "IMPORTANTE: use numeros INTEIROS de 0 a 100.\n"
+            "IMPORTANTE: use numeros INTEIROS de 0 a 100. NUNCA DEVOLVA DECIMAIS.\n"
             'Retorne APENAS este JSON:\n'
             '{"scores": [{"indice": 0, "score": 75, "motivo": "justificativa"}, ...]}\n\n'
             f"PERFIL DO CANDIDATO:\n{json.dumps(perfil, ensure_ascii=False)[:2500]}\n\n"
@@ -668,44 +675,53 @@ async def editar_cv_json(cv_atual: dict, instrucao: str) -> dict:
     return _parse_json(raw)
 
 # =========================================================
-# SUPABASE
+# SUPABASE ASYNC WRAPPERS
 # =========================================================
 
-def salvar_perfil(telegram_id: int, dados: dict):
+async def async_salvar_perfil(telegram_id: int, dados: dict):
     dados["telegram_id"] = str(telegram_id)
-    db_client.table("user_profiles").upsert(dados, on_conflict="telegram_id").execute()
+    await asyncio.to_thread(lambda: db_client.table("user_profiles").upsert(dados, on_conflict="telegram_id").execute())
 
-def atualizar_perfil_estruturado(telegram_id: int, perfil: dict):
-    db_client.table("user_profiles").update({"perfil_estruturado": perfil}).eq("telegram_id", str(telegram_id)).execute()
+async def async_atualizar_perfil_estruturado(telegram_id: str, perfil: dict):
+    update_data = {"perfil_estruturado": perfil}
+    
+    # Extrai atualizacoes de dados pessoais interceptadas pelo LLM
+    dp = perfil.get("dados_pessoais", {})
+    if dp.get("nome"):     update_data["nome_completo"] = dp["nome"]
+    if dp.get("email"):    update_data["email"] = dp["email"]
+    if dp.get("telefone"): update_data["telefone"] = dp["telefone"]
+    if dp.get("linkedin"): update_data["linkedin"] = dp["linkedin"]
+    if dp.get("cidade"):   update_data["cidade"] = dp["cidade"]
 
-def buscar_usuario(telegram_id: int) -> dict | None:
+    await asyncio.to_thread(lambda: db_client.table("user_profiles").update(update_data).eq("telegram_id", str(telegram_id)).execute())
+
+async def async_buscar_usuario(telegram_id: str) -> dict | None:
     try:
-        r = db_client.table("user_profiles").select("*").eq("telegram_id", str(telegram_id)).execute()
+        r = await asyncio.to_thread(lambda: db_client.table("user_profiles").select("*").eq("telegram_id", str(telegram_id)).execute())
         return r.data[0] if r.data else None
     except Exception as e:
         logger.error(f"[Supabase] buscar_usuario: {e}")
         return None
 
-def buscar_todos_usuarios() -> list:
+async def async_buscar_todos_usuarios() -> list:
     try:
-        r = db_client.table("user_profiles").select("*").not_.is_("perfil_estruturado", "null").execute()
+        r = await asyncio.to_thread(lambda: db_client.table("user_profiles").select("*").not_.is_("perfil_estruturado", "null").execute())
         return r.data or []
     except Exception as e:
         logger.error(f"[Supabase] buscar_todos: {e}")
         return []
 
-def job_ja_enviado(telegram_id: str, job_hash: str) -> bool:
+async def async_job_ja_enviado(telegram_id: str, job_hash: str) -> bool:
     try:
-        r = db_client.table("sent_jobs").select("id").eq("telegram_id", telegram_id).eq("job_hash", job_hash).execute()
+        r = await asyncio.to_thread(lambda: db_client.table("sent_jobs").select("id").eq("telegram_id", telegram_id).eq("job_hash", job_hash).execute())
         return bool(r.data)
     except Exception:
         return False
 
-def registrar_job_enviado(telegram_id: str, job_hash: str, title: str, company: str):
+async def async_registrar_job_enviado(telegram_id: str, job_hash: str, title: str, company: str):
     try:
-        db_client.table("sent_jobs").insert({
-            "telegram_id": telegram_id, "job_hash": job_hash, "job_title": title, "job_company": company,
-        }).execute()
+        data = {"telegram_id": telegram_id, "job_hash": job_hash, "job_title": title, "job_company": company}
+        await asyncio.to_thread(lambda: db_client.table("sent_jobs").insert(data).execute())
     except Exception as e:
         logger.error(f"[Supabase] registrar_job: {e}")
 
@@ -750,9 +766,8 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    # Call Supabase async via to_thread to prevent blocking event loop
-    usuario = await asyncio.to_thread(buscar_usuario, user_id)
+    user_id = str(update.effective_user.id)
+    usuario = await async_buscar_usuario(user_id)
     if usuario:
         nome = usuario.get("nome_completo") or update.effective_user.first_name or ""
         await _enviar_menu(update, context, nome)
@@ -839,7 +854,7 @@ async def callback_seniority(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "cargo_alvo":    cargo_alvo,
         "senioridade":   senioridade,
     }
-    await asyncio.to_thread(salvar_perfil, user_id, dados)
+    await async_salvar_perfil(user_id, dados)
     context.user_data.clear()
     
     await query.edit_message_text(
@@ -874,7 +889,7 @@ async def callback_tipo_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Sessao expirada. Envie a vaga novamente.")
         return
     user_id = str(update.effective_user.id)
-    usuario = await asyncio.to_thread(buscar_usuario, user_id)
+    usuario = await async_buscar_usuario(user_id)
     perfil  = (usuario or {}).get("perfil_estruturado") or {}
     tipo_txt = "com resumo" if com_resumo else "sem resumo"
     await query.edit_message_text(f"Gerando curriculo ATS {tipo_txt}... Aguarde.")
@@ -938,7 +953,7 @@ async def processar_e_enviar_vaga(
         await bot.send_message(chat_id=telegram_id, text="\n".join(linhas))
 
     if job_hash:
-        await asyncio.to_thread(registrar_job_enviado, telegram_id, job_hash, titulo, empresa)
+        await async_registrar_job_enviado(telegram_id, job_hash, titulo, empresa)
 
 # =========================================================
 # JOB DIARIO E ROTINAS DE SCRAPING
@@ -946,9 +961,9 @@ async def processar_e_enviar_vaga(
 
 async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
     logger.info("[Scheduler] Iniciando sugestoes diarias...")
-    usuarios = await asyncio.to_thread(buscar_todos_usuarios)
+    usuarios = await async_buscar_todos_usuarios()
     for usuario in usuarios:
-        telegram_id = usuario.get("telegram_id")
+        telegram_id = str(usuario.get("telegram_id"))
         perfil      = usuario.get("perfil_estruturado") or {}
         cidade      = usuario.get("cidade", "Brazil")
         if not telegram_id or not perfil:
@@ -959,7 +974,6 @@ async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
         
         termo_busca = cargo_alvo.strip()
         if not termo_busca:
-            logger.info(f"[Scheduler] Usuario {telegram_id} sem cargo alvo. Pulando.")
             continue
             
         ingles_fluente = perfil_tem_ingles_fluente(perfil)
@@ -973,7 +987,7 @@ async def enviar_sugestoes_diarias(context: ContextTypes.DEFAULT_TYPE):
             
             novas = []
             for v in melhores:
-                ja_enviado = await asyncio.to_thread(job_ja_enviado, telegram_id, gerar_hash_vaga(v))
+                ja_enviado = await async_job_ja_enviado(telegram_id, gerar_hash_vaga(v))
                 if not ja_enviado:
                     novas.append(v)
             
@@ -1000,12 +1014,12 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
         user_id    = str(update.callback_query.from_user.id)
-        status_msg = await update.callback_query.edit_message_text("Iniciando varredura no LinkedIn e Indeed...")
+        status_msg = await update.callback_query.edit_message_text("Iniciando varredura de vagas no LinkedIn e Indeed...")
     else:
         user_id    = str(update.effective_user.id)
-        status_msg = await update.message.reply_text("Iniciando varredura no LinkedIn e Indeed...")
+        status_msg = await update.message.reply_text("Iniciando varredura de vagas no LinkedIn e Indeed...")
 
-    usuario = await asyncio.to_thread(buscar_usuario, user_id)
+    usuario = await async_buscar_usuario(user_id)
     perfil  = usuario.get("perfil_estruturado") if usuario else None
     if not perfil:
         await status_msg.edit_text("Voce ainda nao tem perfil estruturado. Envie um historico profissional base primeiro.")
@@ -1030,7 +1044,7 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     novas = []
     for v in melhores:
-        ja_enviado = await asyncio.to_thread(job_ja_enviado, user_id, gerar_hash_vaga(v))
+        ja_enviado = await async_job_ja_enviado(user_id, gerar_hash_vaga(v))
         if not ja_enviado:
             novas.append(v)
             
@@ -1059,7 +1073,7 @@ async def cmd_testar_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_notificar_pendentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Iniciando varredura de perfis incompletos...")
-    usuarios   = await asyncio.to_thread(buscar_todos_usuarios)
+    usuarios   = await async_buscar_todos_usuarios()
     notificados = 0
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Atualizar Objetivo Agora", callback_data="menu_atualizar_objetivo")]
@@ -1068,7 +1082,7 @@ async def cmd_notificar_pendentes(update: Update, context: ContextTypes.DEFAULT_
         cargo = u.get("cargo_alvo")
         sen   = u.get("senioridade")
         if not cargo or not sen:
-            telegram_id = u.get("telegram_id")
+            telegram_id = str(u.get("telegram_id", ""))
             if not telegram_id:
                 continue
             try:
@@ -1096,7 +1110,7 @@ async def cmd_notificar_pendentes(update: Update, context: ContextTypes.DEFAULT_
 async def cmd_editar_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id  = str(update.effective_user.id)
     cv_atual = context.user_data.get("ultimo_cv")
-    usuario  = context.user_data.get("ultimo_usuario") or await asyncio.to_thread(buscar_usuario, user_id)
+    usuario  = context.user_data.get("ultimo_usuario") or await async_buscar_usuario(user_id)
     if not cv_atual:
         await update.message.reply_text("Nenhum curriculo gerado nesta sessao.")
         return
@@ -1127,7 +1141,7 @@ async def cmd_meu_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.callback_query.from_user.id)
     else:
         user_id = str(update.effective_user.id)
-    usuario = await asyncio.to_thread(buscar_usuario, user_id)
+    usuario = await async_buscar_usuario(user_id)
     if not usuario:
         texto = "Voce ainda nao possui perfil cadastrado. Use /start para comecar."
     else:
@@ -1145,8 +1159,8 @@ async def cmd_deletar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         user_id = str(update.effective_user.id)
     try:
-        await asyncio.to_thread(db_client.table("user_profiles").delete().eq("telegram_id", user_id).execute)
-        await asyncio.to_thread(db_client.table("sent_jobs").delete().eq("telegram_id", user_id).execute)
+        await asyncio.to_thread(lambda: db_client.table("user_profiles").delete().eq("telegram_id", user_id).execute())
+        await asyncio.to_thread(lambda: db_client.table("sent_jobs").delete().eq("telegram_id", user_id).execute())
         msg = "Seus dados foram removidos com sucesso. Use /start para comecar do zero."
     except Exception as e:
         logger.error(f"[Deletar] {e}", exc_info=True)
@@ -1158,7 +1172,7 @@ async def cmd_deletar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    usuario = await asyncio.to_thread(buscar_usuario, user_id)
+    usuario = await async_buscar_usuario(user_id)
 
     if update.message.document:
         doc      = update.message.document
@@ -1173,7 +1187,7 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
                 return
             perfil_atual = (usuario or {}).get("perfil_estruturado") or {}
             novo_perfil  = await consolidar_perfil(perfil_atual, texto)
-            await asyncio.to_thread(atualizar_perfil_estruturado, user_id, novo_perfil)
+            await async_atualizar_perfil_estruturado(user_id, novo_perfil)
             await status.edit_text(
                 "Historico processado e salvo com sucesso!\n\n"
                 "Agora envie uma descricao de vaga ou link do LinkedIn para gerar seu curriculo adaptado."
@@ -1196,11 +1210,11 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         status = await update.message.reply_text("Extraindo vaga do LinkedIn... Aguarde.")
         try:
             vaga = await asyncio.to_thread(extrair_vaga_linkedin, texto_msg)
-            if not vaga:
-                await status.edit_text("Nao consegui extrair a vaga. Verifique o link ou cole a descricao manualmente.")
+            if not vaga.get("sucesso"):
+                await status.edit_text(f"Nao consegui ler a vaga ({vaga.get('erro', '')}). O LinkedIn costuma bloquear robos. Por favor, COPIE O TEXTO da vaga e cole aqui.")
                 return
             await status.delete()
-            await _perguntar_tipo_cv(update, context, vaga)
+            await _perguntar_tipo_cv(update, context, vaga.get("dados"))
         except Exception as e:
             logger.error(f"[LinkedIn] {e}", exc_info=True)
             await status.edit_text(f"Erro ao extrair vaga: {e}")
@@ -1219,7 +1233,7 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         try:
             perfil_atual = (usuario or {}).get("perfil_estruturado") or {}
             novo_perfil  = await consolidar_perfil(perfil_atual, texto_msg)
-            await asyncio.to_thread(atualizar_perfil_estruturado, user_id, novo_perfil)
+            await async_atualizar_perfil_estruturado(user_id, novo_perfil)
             await status.edit_text(
                 "Historico atualizado com sucesso!\n\n"
                 "Agora envie uma descricao de vaga ou link do LinkedIn para gerar seu curriculo adaptado."
@@ -1237,8 +1251,8 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         try:
             perfil_atual = usuario.get("perfil_estruturado") or {}
             novo_perfil  = await editar_perfil_llm(perfil_atual, texto_msg)
-            await asyncio.to_thread(atualizar_perfil_estruturado, user_id, novo_perfil)
-            await status.edit_text("Perfil atualizado com sucesso!")
+            await async_atualizar_perfil_estruturado(user_id, novo_perfil)
+            await status.edit_text("Perfil atualizado. Use /meuperfil para conferir.")
         except Exception as e:
             logger.error(f"[Edicao] {e}", exc_info=True)
             await status.edit_text(f"Erro ao atualizar perfil: {e}")
@@ -1302,10 +1316,13 @@ def main():
     app.add_handler(onboarding)
     app.add_handler(atualizacao_objetivo)
     app.add_handler(CommandHandler("editar_cv",          cmd_editar_cv))
+    app.add_handler(CommandHandler("meuperfil",          cmd_meu_perfil))
     app.add_handler(CommandHandler("meu_perfil",         cmd_meu_perfil))
     app.add_handler(CommandHandler("deletar",            cmd_deletar))
     app.add_handler(CommandHandler("buscar_vagas",       cmd_testar_vagas))
+    app.add_handler(CommandHandler("testar_vagas",       cmd_testar_vagas))
     app.add_handler(CommandHandler("notificar_pendentes", cmd_notificar_pendentes))
+    
     app.add_handler(CallbackQueryHandler(callback_menu,    pattern="^menu_"))
     app.add_handler(CallbackQueryHandler(callback_tipo_cv, pattern="^cv_"))
     app.add_handler(MessageHandler(filters.TEXT | filters.Document.ALL, handle_incoming_message))
