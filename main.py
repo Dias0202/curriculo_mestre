@@ -19,6 +19,8 @@ async def start_webhook() -> None:
     await application.initialize()
     await application.start()
 
+    # Limpa webhook anterior antes de registrar o novo
+    await application.bot.delete_webhook(drop_pending_updates=True)
     webhook_url = f"{settings.webhook_url}/webhook"
     await application.bot.set_webhook(url=webhook_url)
     logger.info("Webhook configurado: %s", webhook_url)
@@ -33,12 +35,24 @@ async def start_webhook() -> None:
     await server.serve()
 
 
+async def _delete_webhook() -> None:
+    """Remove webhook ativo para permitir modo polling."""
+    application = get_application()
+    await application.initialize()
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Webhook anterior removido para modo polling.")
+    await application.shutdown()
+
+
 def start_polling() -> None:
     """Inicia o bot em modo polling (desenvolvimento local)."""
+    # Limpa qualquer webhook ativo antes de iniciar polling
+    asyncio.run(_delete_webhook())
+
     application = get_application()
     logger.info("Modo POLLING (desenvolvimento local) na porta %d", settings.port)
 
-    # Inicia servidor health em background thread para Render
+    # Inicia servidor health em background thread
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -52,10 +66,10 @@ def start_polling() -> None:
         def log_message(self, *a):
             pass
 
-    def _serve():
-        HTTPServer(("0.0.0.0", settings.port), HealthHandler).serve_forever()
-
-    threading.Thread(target=_serve, daemon=True).start()
+    threading.Thread(
+        target=lambda: HTTPServer(("0.0.0.0", settings.port), HealthHandler).serve_forever(),
+        daemon=True,
+    ).start()
 
     from telegram import Update
     application.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -10,9 +10,10 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="ATS Resume Bot", docs_url=None, redoc_url=None)
 
 
+@app.get("/")
 @app.get("/health")
 async def health() -> dict[str, str]:
-    """Healthcheck para UptimeRobot / Render."""
+    """Healthcheck para UptimeRobot / Render (responde em / e /health)."""
     return {"status": "ok", "service": "ats-resume-bot"}
 
 
