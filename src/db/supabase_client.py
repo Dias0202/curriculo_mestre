@@ -103,6 +103,32 @@ async def deletar_usuario(telegram_id: str) -> None:
     )
 
 
+async def buscar_todos_telegram_ids() -> list[str]:
+    """Retorna todos os telegram_ids cadastrados."""
+    try:
+        r = await asyncio.to_thread(
+            lambda: get_client()
+            .table("user_profiles")
+            .select("telegram_id")
+            .execute()
+        )
+        return [str(u["telegram_id"]) for u in (r.data or [])]
+    except Exception as e:
+        logger.error("buscar_todos_telegram_ids: %s", e)
+        return []
+
+
+async def resetar_perfil_estruturado(telegram_id: str) -> None:
+    """Limpa o perfil_estruturado de um usuario (mantém dados de onboarding)."""
+    await asyncio.to_thread(
+        lambda: get_client()
+        .table("user_profiles")
+        .update({"perfil_estruturado": None})
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+
+
 # --- Operacoes de Vagas Enviadas ---
 
 async def job_ja_enviado(telegram_id: str, job_hash: str) -> bool:

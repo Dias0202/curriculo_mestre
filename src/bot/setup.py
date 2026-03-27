@@ -30,6 +30,7 @@ from src.bot.handlers.commands import (
 )
 from src.bot.handlers.menu import callback_menu
 from src.bot.handlers.messages import handle_incoming_message
+from src.bot.handlers.admin import cmd_admin, cmd_broadcast, cmd_reset_perfis, cmd_stats
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,11 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("buscar_vagas", cmd_testar_vagas))
     app.add_handler(CommandHandler("testar_vagas", cmd_testar_vagas))
     app.add_handler(CommandHandler("notificar_pendentes", cmd_notificar_pendentes))
+    # Admin
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("reset_perfis", cmd_reset_perfis))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CallbackQueryHandler(callback_menu, pattern="^menu_"))
     app.add_handler(CallbackQueryHandler(callback_tipo_cv, pattern="^cv_"))
     app.add_handler(MessageHandler(filters.TEXT | filters.Document.ALL, handle_incoming_message))
