@@ -6,9 +6,11 @@ services:
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
-      - key: GEMINI_API_KEY
+      - key: GROQ_API_KEY
         sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
+        sync: false
+      - key: WEBHOOK_URL
         sync: false

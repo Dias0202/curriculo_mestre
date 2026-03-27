@@ -1,4 +1,4 @@
-FROM python:3.11-bullseye
+FROM python:3.11-slim-bullseye
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -15,9 +15,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copia os dois modulos
+COPY src/ src/
 COPY main.py .
-COPY scraper.py .
 
 EXPOSE 10000
 

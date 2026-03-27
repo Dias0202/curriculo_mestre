@@ -7,4 +7,6 @@ python-dotenv
 PyMuPDF
 python-jobspy>=1.1.80
 beautifulsoup4>=4.12.0
-requests>=2.31.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic-settings>=2.2.0
