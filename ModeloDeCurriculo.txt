@@ -1,0 +1,36 @@
+Tipo de Currículo
+
+O formato Cronológico Inverso é o padrão definitivo da indústria. Ele prioriza as experiências mais recentes e relevantes, sendo o modelo mais facilmente processado por algoritmos de triagem e o mais esperado por profissionais de Recursos Humanos. Modelos funcionais ou baseados em habilidades puras dificultam a validação da trajetória pelo algoritmo.
+Estrutura Lógica
+Deve se colocar apenas informações relevantes para uma vaga especifica
+A arquitetura da informação deve ser linear, lida de cima para baixo e da esquerda para a direita.
+
+    Cabeçalho: Nome completo, cidade/estado, telefone com código de área, e-mail profissional e hiperlinks diretos para o LinkedIn e portfólio técnico (como GitHub ou site pessoal). Exclua foto, estado civil, idade ou endereço completo.
+
+    Resumo Profissional: Um parágrafo de três a quatro linhas. Deve conter o título profissional, os anos de experiência, as principais competências técnicas e o impacto central entregue em funções anteriores.
+
+    Experiência Profissional: O núcleo do currículo. Liste o cargo, nome da empresa, mês/ano de início e término. Descreva as responsabilidades em tópicos (bullet points), utilizando verbos de ação e destacando resultados mensuráveis.
+
+    Formação Acadêmica: Grau obtido, nome da instituição e ano de conclusão.
+
+    Competências (Hard Skills): Uma lista direta de softwares, linguagens, ferramentas, frameworks e idiomas. A precisão dos termos técnicos aqui é vital para o ranqueamento em buscas de banco de talentos.
+
+Otimização para Visibilidade (ATS)
+
+Para garantir que o documento seja analisado corretamente pelas plataformas de recrutamento (como Gupy, Workday ou Taleo), regras estritas de formatação devem ser seguidas.
+
+    Formato de Arquivo: Utilize sempre PDF, a menos que o sistema exija explicitamente .docx. O PDF preserva os metadados do texto e a formatação entre diferentes sistemas operacionais.
+
+    Simplicidade Visual: Elimine gráficos, barras de progresso para habilidades, ícones não padronizados, colunas duplas e caixas de texto flutuantes. Os analisadores sintáticos (parsers) dos sistemas ATS não conseguem ler informações fora do fluxo de texto padrão, resultando em perfis em branco no sistema do recrutador.
+
+    Densidade de Palavras-chave: O currículo deve ser um espelho técnico da descrição da vaga. Se a vaga solicita "Análise de Dados com Python", o currículo deve conter exatamente esta string, não apenas "Python" de forma isolada.
+
+    Tipografia Padrão: Utilize fontes limpas e universais (Arial, Calibri, Helvetica ou Roboto) com tamanho entre 10 e 12 pontos para o corpo do texto.
+
+Redação Baseada em Evidências
+
+Em vez de listar tarefas cotidianas, documente conquistas. A métrica recomendada é a fórmula estrutural do Google: "Realizei [X] medido por [Y], fazendo [Z]".
+
+    Exemplo fraco: "Responsável pela otimização de processos."
+
+    Exemplo otimizado: "Reduzi o tempo de processamento de relatórios em 30% (X), economizando 15 horas semanais da equipe (Y), através da automação de scripts em Python (Z)."

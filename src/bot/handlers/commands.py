@@ -82,7 +82,26 @@ async def _perguntar_tipo_cv(
     context: ContextTypes.DEFAULT_TYPE,
     vaga_dados: dict,
 ) -> None:
-    """Pergunta ao usuario se quer CV com ou sem resumo."""
+    """Valida perfil e pergunta ao usuario se quer CV com ou sem resumo."""
+    # Valida perfil antes de oferecer geracao
+    user_id = str(update_or_query.effective_user.id) if hasattr(update_or_query, "effective_user") else ""
+    if user_id:
+        usuario = await db.buscar_usuario(user_id)
+        if usuario:
+            gaps = llm.validar_perfil_para_cv(usuario)
+            if gaps:
+                aviso = (
+                    "Antes de gerar seu curriculo, preciso de dados que estao faltando no seu perfil:\n\n"
+                    + "\n".join(f"- {g}" for g in gaps)
+                    + "\n\nEnvie uma mensagem com essas informacoes (ex: 'Meu nome e Joao Silva, email joao@email.com, telefone 31999998888')."
+                    "\n\nDepois, envie a vaga novamente."
+                )
+                if hasattr(update_or_query, "message") and update_or_query.message:
+                    await update_or_query.message.reply_text(aviso)
+                else:
+                    await update_or_query.reply_text(aviso)
+                return
+
     context.user_data["vaga_pendente"] = vaga_dados
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Com Resumo", callback_data="cv_com_resumo"),

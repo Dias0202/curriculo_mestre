@@ -107,41 +107,75 @@ SCHEMA EXIGIDO:
   ]
 }"""
 
-_SYSTEM_CV = """INSTRUCAO SUPREMA: Voce atua como um Recrutador Tecnico Senior e Especialista em Sistemas ATS.
+_SYSTEM_CV = """INSTRUCAO SUPREMA: Voce e um Recrutador Tecnico Senior, especialista em ATS e engenharia de curriculos.
 
-Sua missao e cruzar o HISTORICO do candidato com os dados da VAGA ALVO e criar um curriculo otimizado em JSON.
+Sua missao: cruzar o HISTORICO do candidato com a VAGA ALVO e gerar um curriculo CRONOLOGICO INVERSO otimizado para ATS.
 
-REGRAS VITAIS E ALGORITMICAS:
-1. EQUIVALENCIA TECNOLOGICA (CRITICO): Se a vaga exige uma ferramenta (ex: Tableau, AWS) e o candidato possui dominio em concorrente (ex: Power BI, GCP), isto e MATCH ABSOLUTO. Escreva "Power BI (Equivalente a Tableau)" e NUNCA liste a ferramenta original como gap.
-2. PREVENCAO DE ALUCINACAO: NUNCA invente experiencias. Se o candidato nao possui o requisito (nem equivalente), liste em "analise_gaps".
-3. METODO STAR: Reescreva os bullet points de experiencias focando em impacto quantificavel.
-4. KEYWORDS OCULTAS: Liste os gaps exigidos pela vaga que o candidato NAO possui, para o stealth ATS.
-5. FORMATO DAS LISTAS (CRITICO): Para "idiomas" e "certificacoes", retorne um ARRAY CONTENDO APENAS STRINGS (Ex: ["Ingles - Avancado"]). E ESTRITAMENTE PROIBIDO INSERIR OBJETOS JSON, DICIONARIOS OU CHAVES NESTES ARRAYS.
+FORMATO CRONOLOGICO INVERSO (OBRIGATORIO):
+- Experiencias mais recentes primeiro
+- Apenas informacoes RELEVANTES para a vaga especifica
+- Leitura linear de cima para baixo
+
+REGRAS VITAIS:
+
+1. RESUMO PROFISSIONAL (3-4 linhas):
+   Estrutura obrigatoria: "[Titulo profissional] com [X anos] de experiencia em [top 3 competencias]. [Principal resultado/impacto entregue em funcoes anteriores]."
+   PROIBIDO: frases vagas como "buscando contribuir", "profissional dedicado", "apaixonado por".
+
+2. BULLET POINTS — FORMULA GOOGLE (CRITICO):
+   Cada bullet DEVE seguir: "Realizei [X] medido por [Y], fazendo [Z]"
+   Exemplo FRACO: "Responsavel pela otimizacao de processos"
+   Exemplo CORRETO: "Reduzi o tempo de processamento de relatorios em 30%, economizando 15h semanais da equipe, atraves da automacao de scripts em Python"
+   - Inicie SEMPRE com verbo de acao forte (Desenvolvi, Implementei, Reduzi, Automatizei, Liderei, Otimizei)
+   - Se o historico nao tem metrica exata, INFIRA uma estimativa realista baseada no contexto (ex: "processamento de 10K+ registros")
+   - MAXIMO 5 bullets por experiencia. Selecione apenas os mais impactantes e relevantes para a vaga.
+
+3. SEM DUPLICACAO (CRITICO):
+   - Cada informacao deve aparecer em APENAS UM LUGAR no curriculo
+   - Se algo esta em "experiencias", NAO repita em "projetos"
+   - O campo "conquistas" deve conter RESULTADOS DIFERENTES das "responsabilidades". Se nao houver conquistas distintas, retorne conquistas como array VAZIO []
+   - NUNCA copie o mesmo texto de responsabilidades para conquistas
+
+4. EQUIVALENCIA TECNOLOGICA: Ferramentas concorrentes (AWS/Azure, Power BI/Tableau) sao MATCH. Escreva "Power BI (equivalente a Tableau)". NAO liste como gap.
+
+5. PREVENCAO DE ALUCINACAO: NUNCA invente experiencias, cargos ou ferramentas. Gaps reais vao em "analise_gaps".
+
+6. COMPETENCIAS: Liste APENAS hard skills e termos tecnicos EXATOS da descricao da vaga que o candidato domina. Maximo 10 itens. Se a vaga pede "Analise de Dados com Python", use esta string exata.
+
+7. KEYWORDS OCULTAS: APENAS tecnologias exigidas pela vaga que o candidato NAO possui (nem equivalente). Maximo 5 termos.
+
+8. FORMATO STRICT: Arrays "idiomas" e "certificacoes" devem conter APENAS STRINGS. Retorne SOMENTE JSON puro.
 
 SCHEMA OBRIGATORIO:
 {
   "identificacao": {
-    "titulo": "Titulo curto do cargo (Maximo 6 palavras)"
+    "titulo": "Titulo curto do cargo-alvo (max 6 palavras)"
   },
-  "resumo": "Paragrafo resumo direcionado a vaga",
-  "competencias": ["Competencia 1", "Competencia 2"],
+  "resumo": "Paragrafo de 3-4 linhas seguindo a estrutura obrigatoria acima",
+  "competencias": ["Hard Skill exata da vaga 1", "Hard Skill 2 (max 10)"],
   "experiencias": [
     {
-      "cargo": "Nome do Cargo", "empresa": "Nome da Empresa", "localizacao": "", "data_inicio": "", "data_fim": "", "descricao_empresa": "",
-      "responsabilidades": ["Tarefa executada"], "conquistas": ["Resultado atingido"]
+      "cargo": "Nome do Cargo",
+      "empresa": "Nome da Empresa",
+      "localizacao": "Cidade, Estado",
+      "data_inicio": "Mes/Ano",
+      "data_fim": "Mes/Ano ou Presente",
+      "descricao_empresa": "",
+      "responsabilidades": ["Verbo de acao + O que fez + Resultado mensuravel (max 5 bullets)"],
+      "conquistas": ["APENAS resultados DISTINTOS das responsabilidades, ou [] se nao houver"]
     }
   ],
   "educacao": [
     {"grau": "", "curso": "", "instituicao": "", "ano_inicio": "", "ano_fim": ""}
   ],
-  "certificacoes": ["Nome da Certificacao - Emissor"],
-  "projetos": [{"nome": "", "descricao": ""}],
+  "certificacoes": ["Certificacao - Emissor"],
+  "projetos": [{"nome": "", "descricao": "Descricao focada em problema resolvido + tecnologias + resultado"}],
   "idiomas": ["Idioma - Nivel"],
-  "keywords_ocultas": ["tecnologia ausente no curriculo"],
+  "keywords_ocultas": ["max 5 termos tecnicos ausentes no candidato"],
   "relatorio_analitico": {
-    "match_score": "Numero inteiro de 0 a 100",
+    "match_score": "Inteiro 0-100",
     "analise_gaps": ["Requisitos criticos que o candidato NAO possui (nem equivalentes)"],
-    "dica_entrevista": "Dica comportamental"
+    "dica_entrevista": "Pergunta tecnica especifica que recrutadores desta vaga fariam + como responder usando experiencia real do candidato"
   }
 }"""
 
@@ -355,16 +389,57 @@ def _sanitizar_cv(cv: dict, usuario: dict, idioma: str = "Portugues") -> dict:
     if "identificacao" not in cv or not isinstance(cv["identificacao"], dict):
         cv["identificacao"] = {}
 
+    # Puxa dados_pessoais do perfil_estruturado como fallback
+    perfil = usuario.get("perfil_estruturado") or {}
+    dp = perfil.get("dados_pessoais", {})
+
     ident = cv["identificacao"]
-    ident["nome"] = usuario.get("nome_completo") or "Candidato"
-    ident["email"] = usuario.get("email") or ""
-    ident["telefone"] = usuario.get("telefone") or ""
-    ident["linkedin"] = usuario.get("linkedin") or ""
-    ident["localizacao"] = usuario.get("cidade") or ""
+    ident["nome"] = usuario.get("nome_completo") or dp.get("nome") or ""
+    ident["email"] = usuario.get("email") or dp.get("email") or ""
+    ident["telefone"] = usuario.get("telefone") or dp.get("telefone") or ""
+    ident["linkedin"] = usuario.get("linkedin") or dp.get("linkedin") or ""
+    ident["localizacao"] = usuario.get("cidade") or dp.get("cidade") or ""
 
     titulo = str(ident.get("titulo", "")).strip()
     palavras = titulo.split()
     if len(palavras) > 6:
         ident["titulo"] = " ".join(palavras[:6])
 
+    # Remove conquistas duplicadas de responsabilidades
+    for exp in cv.get("experiencias", []):
+        if not isinstance(exp, dict):
+            continue
+        resps = set(str(r).strip().lower() for r in exp.get("responsabilidades", []))
+        conquistas_originais = exp.get("conquistas", [])
+        if isinstance(conquistas_originais, list):
+            exp["conquistas"] = [
+                c for c in conquistas_originais
+                if str(c).strip().lower() not in resps
+            ]
+
     return cv
+
+
+def validar_perfil_para_cv(usuario: dict) -> list[str]:
+    """Retorna lista de campos criticos ausentes no perfil do usuario."""
+    campos_criticos = {
+        "nome_completo": "seu NOME COMPLETO",
+        "email": "seu E-MAIL profissional",
+        "telefone": "seu TELEFONE com DDD",
+        "linkedin": "seu perfil do LINKEDIN (URL)",
+        "cidade": "sua CIDADE e ESTADO",
+    }
+    perfil = usuario.get("perfil_estruturado") or {}
+    dp = perfil.get("dados_pessoais", {})
+
+    ausentes: list[str] = []
+    for campo, descricao in campos_criticos.items():
+        valor_usuario = str(usuario.get(campo) or "").strip()
+        valor_dp = str(dp.get(campo.replace("nome_completo", "nome")) or "").strip()
+        if not valor_usuario and not valor_dp:
+            ausentes.append(descricao)
+
+    if not perfil.get("experiences") and not perfil.get("education"):
+        ausentes.append("seu HISTORICO PROFISSIONAL (envie PDF ou texto)")
+
+    return ausentes

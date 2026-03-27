@@ -36,10 +36,24 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
             perfil_atual = (usuario or {}).get("perfil_estruturado") or {}
             novo_perfil = await llm.consolidar_perfil(perfil_atual, texto)
             await db.atualizar_perfil_estruturado(user_id, novo_perfil)
-            await status.edit_text(
-                "Historico processado e salvo com sucesso!\n\n"
-                "Agora envie uma descricao de vaga ou link do LinkedIn para gerar seu curriculo adaptado."
-            )
+
+            # Recarrega usuario e verifica gaps
+            usuario_atualizado = await db.buscar_usuario(user_id)
+            gaps = llm.validar_perfil_para_cv(usuario_atualizado or {})
+            if gaps:
+                aviso_gaps = (
+                    "Historico processado e salvo!\n\n"
+                    "Porem, detectei dados importantes faltando no seu perfil:\n"
+                    + "\n".join(f"- {g}" for g in gaps)
+                    + "\n\nEnvie uma mensagem com essas informacoes para completar seu perfil. "
+                    "Ex: 'Meu nome e Joao Silva, email joao@email.com, moro em BH MG'"
+                )
+                await status.edit_text(aviso_gaps)
+            else:
+                await status.edit_text(
+                    "Historico processado e salvo com sucesso!\n\n"
+                    "Agora envie uma descricao de vaga ou link do LinkedIn para gerar seu curriculo adaptado."
+                )
         except Exception as e:
             logger.error("handle_document: %s", e, exc_info=True)
             await status.edit_text(f"Erro ao processar arquivo: {e}")
@@ -86,10 +100,22 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
             perfil_atual = (usuario or {}).get("perfil_estruturado") or {}
             novo_perfil = await llm.consolidar_perfil(perfil_atual, texto_msg)
             await db.atualizar_perfil_estruturado(user_id, novo_perfil)
-            await status.edit_text(
-                "Historico atualizado com sucesso!\n\n"
-                "Agora envie uma descricao de vaga ou link do LinkedIn para gerar seu curriculo adaptado."
-            )
+
+            usuario_atualizado = await db.buscar_usuario(user_id)
+            gaps = llm.validar_perfil_para_cv(usuario_atualizado or {})
+            if gaps:
+                aviso_gaps = (
+                    "Historico atualizado!\n\n"
+                    "Detectei dados importantes faltando:\n"
+                    + "\n".join(f"- {g}" for g in gaps)
+                    + "\n\nEnvie essas informacoes para completar seu perfil."
+                )
+                await status.edit_text(aviso_gaps)
+            else:
+                await status.edit_text(
+                    "Historico atualizado com sucesso!\n\n"
+                    "Agora envie uma descricao de vaga ou link do LinkedIn para gerar seu curriculo adaptado."
+                )
         except Exception as e:
             logger.error("handle_historico: %s", e, exc_info=True)
             await status.edit_text(f"Erro ao processar historico: {e}")

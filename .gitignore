@@ -31,3 +31,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Test artifacts
+exemploatual/
+
+# Render yaml must NOT be ignored
+!render.yaml

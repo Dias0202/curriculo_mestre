@@ -162,22 +162,27 @@ class CurriculoHarvard(FPDF):
                 self.multi_cell(0, 4, sanitize(desc_emp), new_x="LMARGIN", new_y="NEXT")
             self.ln(1)
 
+            # Unifica responsabilidades + conquistas em lista unica de bullets
+            todos_bullets: list[str] = []
             resps = exp.get("responsabilidades", [])
             if isinstance(resps, str):
                 resps = [resps]
             for r in resps:
                 val = clean_null_value(self._flatten_item(r))
                 if val:
-                    self._bullet(val, "-")
+                    todos_bullets.append(val)
 
             conquistas = exp.get("conquistas", [])
             if isinstance(conquistas, str):
                 conquistas = [conquistas]
+            resps_lower = {b.lower().strip() for b in todos_bullets}
             for c in conquistas:
                 val = clean_null_value(self._flatten_item(c))
-                if val:
-                    self.set_font("helvetica", "B", 10)
-                    self.multi_cell(0, 5, sanitize(f">> {val}"), new_x="LMARGIN", new_y="NEXT")
+                if val and val.lower().strip() not in resps_lower:
+                    todos_bullets.append(val)
+
+            for bullet in todos_bullets:
+                self._bullet(bullet, "-")
             self.ln(3)
 
     def bloco_educacao(self, titulo: str, edus: list) -> None:
@@ -236,14 +241,17 @@ class CurriculoHarvard(FPDF):
             self.ln(2)
 
     def bloco_keywords_ocultas(self, keywords: list) -> None:
+        """Renderiza keywords ATS invisiveis (branco sobre branco, 1pt)."""
         if not keywords:
             return
         termos = [sanitize(str(k)) for k in keywords if clean_null_value(k)]
         if not termos:
             return
+        # Posiciona no rodape da ultima pagina para evitar vazamento visual
+        self.ln(2)
         self.set_text_color(255, 255, 255)
         self.set_font("helvetica", "", 1)
-        self.multi_cell(0, 1, " ".join(termos), new_x="LMARGIN", new_y="NEXT")
+        self.cell(0, 0.5, " , ".join(termos), new_x="LMARGIN", new_y="NEXT")
         self.set_text_color(0, 0, 0)
 
 
